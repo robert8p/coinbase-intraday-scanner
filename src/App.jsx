@@ -520,10 +520,348 @@ function StatusTab({health}) {
   </Box>;
 }
 
+// ─── V2 ──────────────────────────────────────────────────────────
+// Stage 1 UI: trigger training, watch progress, list trained cells, download diagnostic.
+// Preset cells let you click to train without typing anything.
+const V2_PRESETS = [
+  { k_atr: 0.5, horizon_hours: 2,  label: "k=0.5 / 2h  (low bar, fast)"    },
+  { k_atr: 1.0, horizon_hours: 4,  label: "k=1.0 / 4h  (baseline)"         },
+  { k_atr: 1.5, horizon_hours: 8,  label: "k=1.5 / 8h  (moderate)"         },
+  { k_atr: 2.0, horizon_hours: 12, label: "k=2.0 / 12h (high bar, slow)"   },
+  { k_atr: 2.5, horizon_hours: 24, label: "k=2.5 / 24h (high bar, 1-day)"  },
+];
+
+function V2Tab() {
+  const [progress, setProgress] = useState(null);
+  const [models, setModels] = useState([]);
+  const [selectedCell, setSelectedCell] = useState(null);
+  const [cellDetail, setCellDetail] = useState(null);
+  const [customK, setCustomK] = useState(1.0);
+  const [customH, setCustomH] = useState(4);
+  const [error, setError] = useState(null);
+
+  // Poll progress + models every 3s
+  useEffect(() => {
+    const fetchAll = () => {
+      fetch('/api/v2/training/progress').then(r => r.json()).then(setProgress).catch(() => {});
+      fetch('/api/v2/models').then(r => r.json()).then(d => setModels(d.models || [])).catch(() => {});
+    };
+    fetchAll();
+    const iv = setInterval(fetchAll, 3000);
+    return () => clearInterval(iv);
+  }, []);
+
+  const trainCell = useCallback(async (k_atr, horizon_hours) => {
+    setError(null);
+    try {
+      const r = await fetch('/api/v2/train', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({k_atr, horizon_hours}),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (d.status === "already_running") {
+        setError(`Training already in progress — wait for current cell to finish`);
+        return;
+      }
+    } catch (e) {
+      setError(e.message);
+    }
+  }, []);
+
+  const fetchCellDetail = useCallback(async (k_atr, horizon_hours) => {
+    setSelectedCell({k_atr, horizon_hours});
+    setCellDetail(null);
+    try {
+      const r = await fetch(`/api/v2/model/${k_atr}/${horizon_hours}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setCellDetail(await r.json());
+    } catch (e) {
+      setCellDetail({error: e.message});
+    }
+  }, []);
+
+  const downloadDiag = useCallback(async () => {
+    try {
+      const r = await fetch('/api/v2/diagnostic');
+      const b = await r.blob();
+      const fn = r.headers.get('content-disposition')?.match(/filename="(.+)"/)?.[1] || 'v2_diag.json';
+      const u = URL.createObjectURL(b);
+      const a = document.createElement('a');
+      a.href = u; a.download = fn;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a); URL.revokeObjectURL(u);
+    } catch (e) { alert(e.message); }
+  }, []);
+
+  const ip = progress?.inProgress;
+  const phase = progress?.phase;
+
+  // Color-code precision: green ≥0.70, yellow 0.55-0.70, red <0.55
+  const precColor = (p) => {
+    if (p == null) return "#64748b";
+    if (p >= 0.70) return "#22c55e";
+    if (p >= 0.55) return "#eab308";
+    return "#ef4444";
+  };
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+      {/* ── BANNER ── */}
+      <Box>
+        <div style={{fontSize:11,color:"#8b5cf6",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6,fontWeight:700}}>
+          v2 Stage 1 — Vol-Normalized Threshold Classifier
+        </div>
+        <div style={{fontSize:12,color:"#94a3b8",lineHeight:1.6}}>
+          Asks: "will price touch <span style={{color:"#e2e8f0"}}>+k × coin's 7-day ATR</span> at any point within <span style={{color:"#e2e8f0"}}>H hours</span>?"
+          Each (k, H) combination is a separate model — train several and compare precision at the 0.75 threshold.
+          A cell is <span style={{color:"#22c55e"}}>productive</span> if precision @ 0.75 ≥ 70% with ≥1 prediction/day.
+        </div>
+      </Box>
+
+      {/* ── PROGRESS ── */}
+      <Box>
+        <Lbl>Training Progress</Lbl>
+        {!progress ? (
+          <div style={{fontSize:12,color:"#475569"}}>Loading...</div>
+        ) : ip ? (
+          <div>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${progress.pct||0}%`,height:"100%",background:"#8b5cf6",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#8b5cf6",fontWeight:600,minWidth:36,textAlign:"right"}}>{progress.pct||0}%</span>
+            </div>
+            <div style={{fontSize:12,color:"#94a3b8"}}>{progress.message}</div>
+            {progress.cell && (
+              <div style={{fontSize:11,color:"#64748b",marginTop:4}}>
+                Training cell: k={progress.cell.k_atr}, H={progress.cell.horizon_hours}h
+              </div>
+            )}
+          </div>
+        ) : phase === "done" ? (
+          <div style={{fontSize:12,color:"#22c55e"}}>✓ {progress.message}</div>
+        ) : phase === "error" ? (
+          <div style={{fontSize:12,color:"#ef4444"}}>✗ {progress.message}</div>
+        ) : (
+          <div style={{fontSize:12,color:"#475569"}}>Idle — click a preset below to start training.</div>
+        )}
+      </Box>
+
+      {error && (
+        <div style={{padding:"8px 12px",borderRadius:6,background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:12}}>
+          {error}
+        </div>
+      )}
+
+      {/* ── TRAIN BUTTONS ── */}
+      <Box>
+        <Lbl>Train a Cell</Lbl>
+        <div style={{fontSize:11,color:"#64748b",marginBottom:10}}>
+          Each cell is an independent experiment. Click a preset or enter custom values.
+          Training reuses cached bars from v1 (if fresh) → ~3-5 min; otherwise refetches → ~20-30 min.
+        </div>
+
+        <div style={{fontSize:10,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:6}}>Presets</div>
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:16}}>
+          {V2_PRESETS.map(p => (
+            <Btn
+              key={`${p.k_atr}_${p.horizon_hours}`}
+              onClick={() => trainCell(p.k_atr, p.horizon_hours)}
+              disabled={ip}
+              color="#8b5cf6"
+              style={{padding:"6px 12px",fontSize:11}}
+            >
+              {p.label}
+            </Btn>
+          ))}
+        </div>
+
+        <div style={{fontSize:10,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:6}}>Custom</div>
+        <div style={{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}}>
+          <label style={{fontSize:11,color:"#94a3b8",display:"flex",flexDirection:"column",gap:4}}>
+            <span>k_atr (0.1–10)</span>
+            <input type="number" step="0.1" min="0.1" max="10" value={customK}
+              onChange={e=>setCustomK(parseFloat(e.target.value)||1.0)} disabled={ip}
+              style={{width:70,padding:"4px 6px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:4,color:"#e2e8f0",fontFamily:F,fontSize:12}}/>
+          </label>
+          <label style={{fontSize:11,color:"#94a3b8",display:"flex",flexDirection:"column",gap:4}}>
+            <span>horizon_hours (1–72)</span>
+            <input type="number" step="1" min="1" max="72" value={customH}
+              onChange={e=>setCustomH(parseInt(e.target.value)||4)} disabled={ip}
+              style={{width:70,padding:"4px 6px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:4,color:"#e2e8f0",fontFamily:F,fontSize:12}}/>
+          </label>
+          <Btn
+            onClick={() => trainCell(customK, customH)}
+            disabled={ip}
+            color="#8b5cf6"
+            style={{padding:"6px 14px",fontSize:11,marginTop:18}}
+          >
+            Train k={customK} / {customH}h
+          </Btn>
+        </div>
+      </Box>
+
+      {/* ── TRAINED CELLS ── */}
+      <Box>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <Lbl>Trained Cells ({models.length})</Lbl>
+          {models.length > 0 && (
+            <Btn onClick={downloadDiag} color="#f97316" style={{padding:"4px 10px",fontSize:11}}>
+              ⬇ Download all (v2 diagnostic)
+            </Btn>
+          )}
+        </div>
+        {models.length === 0 ? (
+          <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
+            No cells trained yet. Click a preset above to start.
+          </div>
+        ) : (
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+              <thead>
+                <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+                  {["Cell","AUC (test)","Base rate","Prec @ 0.75","N @ 0.75","Per day","Iter","Trained"].map(h => (
+                    <th key={h} style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500,letterSpacing:0.5,textTransform:"uppercase"}}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {models
+                  .slice()
+                  .sort((a,b) => (b.precision_at_0_75 ?? 0) - (a.precision_at_0_75 ?? 0))
+                  .map(m => {
+                  const sel = selectedCell && selectedCell.k_atr === m.k_atr && selectedCell.horizon_hours === m.horizon_hours;
+                  const aucC = m.auc_test >= 0.65 ? "#22c55e" : m.auc_test >= 0.55 ? "#eab308" : "#ef4444";
+                  return (
+                    <tr key={`${m.k_atr}_${m.horizon_hours}`}
+                      onClick={() => fetchCellDetail(m.k_atr, m.horizon_hours)}
+                      style={{borderBottom:"1px solid rgba(255,255,255,0.03)",cursor:"pointer",
+                        background:sel?"rgba(139,92,246,0.08)":"transparent"}}>
+                      <td style={{padding:"6px 8px",color:"#e2e8f0",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>
+                        k={m.k_atr} / {m.horizon_hours}h
+                      </td>
+                      <td style={{padding:"6px 8px",fontVariantNumeric:"tabular-nums",color:aucC,fontWeight:600}}>
+                        {m.auc_test?.toFixed(3) ?? "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                        {m.base_rate_test != null ? `${(m.base_rate_test*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",fontVariantNumeric:"tabular-nums",color:precColor(m.precision_at_0_75),fontWeight:700}}>
+                        {m.precision_at_0_75 != null ? `${(m.precision_at_0_75*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                        {m.n_at_0_75 ?? 0}
+                      </td>
+                      <td style={{padding:"6px 8px",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                        {m.per_day_at_0_75?.toFixed(1) ?? "0"}
+                      </td>
+                      <td style={{padding:"6px 8px",fontVariantNumeric:"tabular-nums",color:"#64748b"}}>
+                        {m.best_iteration ?? "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",fontSize:10,color:"#475569"}}>
+                        {m.trained_at ? new Date(m.trained_at).toLocaleString() : "—"}
+                      </td>
+                    </tr>);
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Box>
+
+      {/* ── CELL DETAIL ── */}
+      {selectedCell && (
+        <Box>
+          <Lbl>Cell Detail — k={selectedCell.k_atr} / {selectedCell.horizon_hours}h</Lbl>
+          {!cellDetail ? (
+            <div style={{color:"#475569",fontSize:12}}>Loading...</div>
+          ) : cellDetail.error ? (
+            <div style={{color:"#ef4444",fontSize:12}}>{cellDetail.error}</div>
+          ) : (
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+              <div>
+                <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:8}}>Precision by confidence threshold</div>
+                <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                  <thead>
+                    <tr style={{borderBottom:"1px solid rgba(255,255,255,0.06)"}}>
+                      <th style={{padding:"4px 6px",textAlign:"left",color:"#64748b",fontSize:10}}>Threshold</th>
+                      <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Precision</th>
+                      <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>N</th>
+                      <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Per day</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cellDetail.precision_at_threshold && Object.entries(cellDetail.precision_at_threshold).map(([t, d]) => (
+                      <tr key={t} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                        <td style={{padding:"4px 6px",fontVariantNumeric:"tabular-nums"}}>{t}</td>
+                        <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(d.precision),fontWeight:600}}>
+                          {d.n_predictions > 0 ? `${(d.precision*100).toFixed(1)}%` : "—"}
+                        </td>
+                        <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                          {d.n_predictions}
+                        </td>
+                        <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                          {d.avg_per_day?.toFixed(1) ?? "0"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div style={{marginTop:16}}>
+                  <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6}}>Top-K precision</div>
+                  <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.8}}>
+                    {cellDetail.top_k_precision && Object.entries(cellDetail.top_k_precision).map(([k, d]) => (
+                      <div key={k}><span style={{color:"#64748b",display:"inline-block",minWidth:110}}>{k.replace(/_/g," ")}</span>
+                        <span style={{color:precColor(d.precision),fontWeight:600,marginLeft:8}}>
+                          {(d.precision*100).toFixed(1)}%
+                        </span>
+                        <span style={{color:"#475569",marginLeft:6,fontSize:10}}>(n={d.n})</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <div style={{marginTop:16,fontSize:11,color:"#94a3b8",lineHeight:1.8}}>
+                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:110}}>Train/Val/Test rows:</span>
+                    <span style={{fontVariantNumeric:"tabular-nums"}}>{cellDetail.train_rows} / {cellDetail.val_rows} / {cellDetail.test_rows}</span></div>
+                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:110}}>Embargo:</span>
+                    <span style={{fontVariantNumeric:"tabular-nums"}}>{cellDetail.embargo_days} days</span></div>
+                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:110}}>Best iter:</span>
+                    <span style={{fontVariantNumeric:"tabular-nums"}}>{cellDetail.best_iteration}</span></div>
+                </div>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:8}}>Feature importance (top 15)</div>
+                {cellDetail.feature_importance && Object.entries(cellDetail.feature_importance)
+                  .sort(([,a],[,b]) => b-a).slice(0,15).map(([name, val]) => {
+                    const allVals = Object.values(cellDetail.feature_importance);
+                    const max = Math.max(...allVals);
+                    return (
+                      <div key={name} style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+                        <span style={{width:150,fontSize:10,color:"#94a3b8",textAlign:"right",flexShrink:0,fontFamily:F}}>{name}</span>
+                        <div style={{flex:1,height:12,background:"rgba(255,255,255,0.04)",borderRadius:2,overflow:"hidden"}}>
+                          <div style={{width:`${(val/max)*100}%`,height:"100%",borderRadius:2,background:"#8b5cf6"}}/>
+                        </div>
+                        <span style={{fontSize:10,color:"#64748b",minWidth:36,textAlign:"right",fontVariantNumeric:"tabular-nums"}}>
+                          {(val*100).toFixed(1)}%
+                        </span>
+                      </div>);
+                  })}
+              </div>
+            </div>
+          )}
+        </Box>
+      )}
+    </div>
+  );
+}
+
 // ─── MAIN ────────────────────────────────────────────────────────
 export default function CoinbaseScanner() {
   const [scanHour,setScanHour]=useState(12);
-  const [tab,setTab]=useState("scanner");
+  const [tab,setTab]=useState("v2");
   const [data,setData]=useState([]);
   const [source,setSource]=useState("loading");
   const [loading,setLoading]=useState(true);
@@ -563,7 +901,7 @@ export default function CoinbaseScanner() {
     }catch(e){alert(e.message);}
   },[]);
 
-  const tabs=[{id:"scanner",l:"Scanner"},{id:"training",l:"Training",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes",c:"#22c55e"},{id:"status",l:"Status"}];
+  const tabs=[{id:"v2",l:"v2 Research",c:"#8b5cf6"},{id:"scanner",l:"Scanner (v1)"},{id:"training",l:"Training (v1)",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes (v1)",c:"#22c55e"},{id:"status",l:"Status"}];
 
   return (
     <div style={{fontFamily:F,background:"#0c0f14",color:"#e2e8f0",minHeight:"100vh"}}>
@@ -574,9 +912,10 @@ export default function CoinbaseScanner() {
         </div>
         <div style={{display:"flex",gap:4,fontSize:11,flexWrap:"wrap",alignItems:"center"}}>
           <span style={{color:"#eab308",fontWeight:600}}>
-            {health ? `TP +${health.tp_pct}% / SL -${health.sl_pct}% / ${health.horizonHours||4}h horizon (BE ${health.breakeven}%)` : "Loading..."}
+            {tab==="v2" ? "v2 — Vol-normalized threshold classifier (Stage 1)" :
+              health ? `TP +${health.tp_pct}% / SL -${health.sl_pct}% / ${health.horizonHours||4}h horizon (BE ${health.breakeven}%)` : "Loading..."}
           </span>
-          {lastUpdate&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
+          {lastUpdate&&tab!=="v2"&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
         </div>
       </div>
 
@@ -595,6 +934,7 @@ export default function CoinbaseScanner() {
       {error&&<div style={{margin:"12px 20px 0",padding:"8px 12px",borderRadius:6,background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:12}}>{error}</div>}
 
       <div style={{padding:"16px 20px"}}>
+        {tab==="v2"&&<V2Tab/>}
         {tab==="scanner"&&<ScannerTab data={data} scanHour={scanHour} source={source} elapsed={elapsed} message={message} modelWR10={modelWR10} modelPnL10={modelPnL10} health={health} scanInfo={scanInfo}/>}
         {tab==="training"&&<TrainingTab/>}
         {tab==="outcomes"&&<OutcomesTab/>}

@@ -1349,6 +1349,163 @@ def diagnostic():
             "dateRange":{"first":outcome_files[0].stem,"last":outcome_files[-1].stem} if outcome_files else None}
     }, headers={"Content-Disposition":f'attachment; filename="coinbase_diagnostic_{today_utc()}.json"'})
 
+# ═══════════════════════════════════════════════════════════════════
+# v2 — Vol-normalized threshold classifier (Stage 1)
+# ═══════════════════════════════════════════════════════════════════
+# v1 endpoints above remain for backward-compatibility only and should not be
+# used to draw conclusions. The productive work lives under /api/v2/ below.
+import v2 as v2_module
+
+V2_MODEL_DIR = DATA_DIR / "models_v2"
+V2_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+v2_training_in_progress = False
+v2_training_progress = {"phase":"idle","pct":0,"message":"","cell":None}
+
+def _v2_progress_cb(pct, msg):
+    global v2_training_progress
+    v2_training_progress = {**v2_training_progress, "pct":pct, "message":msg}
+
+def _v2_run_train(k_atr, horizon_hours):
+    """Background task wrapper for v2 cell training."""
+    global v2_training_in_progress, v2_training_progress
+    if v2_training_in_progress:
+        log.warning("v2 training already in progress, skipping")
+        return
+    v2_training_in_progress = True
+    v2_training_progress = {"phase":"starting","pct":0,
+        "message":f"Starting cell k={k_atr}, H={horizon_hours}h",
+        "cell":{"k_atr":k_atr,"horizon_hours":horizon_hours}}
+    try:
+        # Reuse v1's cached intraday & daily bars if available
+        daily_age = cache_age_hours(BARS_DAILY_CACHE)
+        intra_age = cache_age_hours(BARS_INTRADAY_CACHE)
+        cache_fresh = daily_age < CACHE_MAX_AGE_HOURS and intra_age < CACHE_MAX_AGE_HOURS
+        if cache_fresh:
+            _v2_progress_cb(2, f"Loading cached bars (age {intra_age:.1f}h)...")
+            log.info(f"v2 using cached bars (daily {daily_age:.1f}h, intra {intra_age:.1f}h)")
+            daily = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+            intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+        else:
+            _v2_progress_cb(2, "No fresh cache — fetching from Coinbase...")
+            log.info("v2 fetching fresh bars")
+            client = cb_client()
+            end_dt = now_utc().replace(minute=0, second=0, microsecond=0)
+            start_dt = end_dt - timedelta(days=TRAIN_DAYS)
+            fetch_products = list(set(PRODUCTS + [BENCHMARK]))
+            daily = fetch_candles_bulk(client, fetch_products, start_dt, end_dt, 86400)
+            _v2_progress_cb(4, f"Fetching {TRAIN_DAYS}d of 15-min bars...")
+            intraday = fetch_candles_bulk(
+                client, fetch_products, start_dt, end_dt, CANDLE_GRANULARITY)
+            client.close()
+            BARS_DAILY_CACHE.write_bytes(pickle.dumps(daily))
+            BARS_INTRADAY_CACHE.write_bytes(pickle.dumps(intraday))
+            log.info(f"v2 cached {sum(len(v) for v in intraday.values())} intraday bars")
+
+        v2_training_progress["phase"] = "training"
+        meta = v2_module.run_train_cell_v2(
+            k_atr=k_atr,
+            horizon_hours=horizon_hours,
+            intraday_bars=intraday,
+            daily_bars=daily,
+            products=PRODUCTS,
+            categories=CATEGORIES,
+            benchmark=BENCHMARK,
+            model_dir=V2_MODEL_DIR,
+            scan_hours=SCAN_HOURS,
+            progress_cb=_v2_progress_cb,
+        )
+        v2_training_progress = {"phase":"done","pct":100,
+            "message":f"Done. k={k_atr}, H={horizon_hours}h — "
+                      f"AUC {meta['auc_test']}, "
+                      f"prec@0.75 {meta['precision_at_threshold']['0.75']['precision']} "
+                      f"(n={meta['precision_at_threshold']['0.75']['n_predictions']})",
+            "cell":{"k_atr":k_atr,"horizon_hours":horizon_hours},
+            "meta": meta}
+    except Exception as e:
+        log.exception(f"v2 training failed: {e}")
+        v2_training_progress = {"phase":"error","pct":0,
+            "message":f"Error: {e}",
+            "cell":{"k_atr":k_atr,"horizon_hours":horizon_hours}}
+    finally:
+        v2_training_in_progress = False
+
+class V2TrainRequest(BaseModel):
+    k_atr: float
+    horizon_hours: int
+
+@app.post("/api/v2/train")
+def v2_trigger_train(bg: BackgroundTasks, req: V2TrainRequest):
+    """Train one (k_atr, horizon_hours) cell.
+    Body: {"k_atr": 1.0, "horizon_hours": 4}"""
+    if v2_training_in_progress:
+        return JSONResponse({"status":"already_running",
+            "progress":v2_training_progress}, 409)
+    if not (0.1 <= req.k_atr <= 10.0):
+        return JSONResponse({"error":"k_atr must be 0.1-10.0"}, 400)
+    if not (1 <= req.horizon_hours <= 72):
+        return JSONResponse({"error":"horizon_hours must be 1-72"}, 400)
+    bg.add_task(_v2_run_train, req.k_atr, req.horizon_hours)
+    return {"status":"started","k_atr":req.k_atr,"horizon_hours":req.horizon_hours}
+
+@app.get("/api/v2/training/progress")
+def v2_get_progress():
+    return {"inProgress": v2_training_in_progress, **v2_training_progress}
+
+@app.get("/api/v2/models")
+def v2_list_models():
+    """List all trained v2 cells with their summary metrics."""
+    cells = []
+    for meta_file in sorted(V2_MODEL_DIR.glob("v2_*_meta.json")):
+        try:
+            m = json.loads(meta_file.read_text())
+            cells.append({
+                "k_atr": m.get("k_atr"),
+                "horizon_hours": m.get("horizon_hours"),
+                "trained_at": m.get("trained_at"),
+                "auc_test": m.get("auc_test"),
+                "base_rate_test": m.get("base_rate_test"),
+                "precision_at_0_75": m.get("precision_at_threshold", {}).get("0.75", {}).get("precision"),
+                "n_at_0_75": m.get("precision_at_threshold", {}).get("0.75", {}).get("n_predictions"),
+                "per_day_at_0_75": m.get("precision_at_threshold", {}).get("0.75", {}).get("avg_per_day"),
+                "best_iteration": m.get("best_iteration"),
+            })
+        except Exception as e:
+            log.warning(f"v2 models list: skipping {meta_file.name}: {e}")
+    return {"models": cells, "count": len(cells)}
+
+@app.get("/api/v2/model/{k_atr}/{horizon_hours}")
+def v2_get_model(k_atr: float, horizon_hours: int):
+    """Full metadata for one cell."""
+    cell_key = f"k{k_atr:g}_h{horizon_hours}"
+    meta_file = V2_MODEL_DIR / f"v2_{cell_key}_meta.json"
+    if not meta_file.exists():
+        return JSONResponse({"error":"no such cell","cell_key":cell_key}, 404)
+    return JSONResponse(json.loads(meta_file.read_text()))
+
+@app.get("/api/v2/diagnostic")
+def v2_diagnostic():
+    """All v2 models + their full metadata in one downloadable JSON."""
+    cells = {}
+    for meta_file in sorted(V2_MODEL_DIR.glob("v2_*_meta.json")):
+        try:
+            m = json.loads(meta_file.read_text())
+            cell_key = f"k{m['k_atr']:g}_h{m['horizon_hours']}"
+            cells[cell_key] = m
+        except:
+            continue
+    return JSONResponse({
+        "_type": "coinbase_scanner_v2_diagnostic",
+        "_version": "v2.0_stage1",
+        "generatedAt": datetime.now(UTC).isoformat(),
+        "universe_size": len(PRODUCTS),
+        "benchmark": BENCHMARK,
+        "n_features": len(v2_module.FEATURE_NAMES_V2),
+        "feature_names": v2_module.FEATURE_NAMES_V2,
+        "cells": cells,
+    }, headers={"Content-Disposition":
+        f'attachment; filename="coinbase_v2_diagnostic_{today_utc()}.json"'})
+
 # SPA fallback
 dist_path = Path(__file__).parent / "dist"
 if dist_path.exists():
