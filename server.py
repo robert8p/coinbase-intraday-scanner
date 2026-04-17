@@ -1506,6 +1506,329 @@ def v2_diagnostic():
     }, headers={"Content-Disposition":
         f'attachment; filename="coinbase_v2_diagnostic_{today_utc()}.json"'})
 
+# ═══════════════════════════════════════════════════════════════════
+# v2 STAGE 2 — Rule mining endpoints
+# ═══════════════════════════════════════════════════════════════════
+import v2_rules as v2_rules_module
+
+V2_RULES_DIR = DATA_DIR / "rules_v2"
+V2_RULES_DIR.mkdir(parents=True, exist_ok=True)
+
+v2_mining_in_progress = False
+v2_mining_progress = {"phase":"idle","pct":0,"message":"","params":None}
+v2_mining_last_result = None  # Last finished mining run summary
+
+def _v2_rules_progress_cb(pct, msg):
+    global v2_mining_progress
+    v2_mining_progress = {**v2_mining_progress, "pct":pct, "message":msg}
+
+def _v2_run_mining(threshold_pct, horizon_hours_list, methods,
+                     min_precision, min_support, min_lift):
+    """
+    Background task: mine rules across specified horizons for one threshold.
+
+    Implementation notes:
+    - All horizons share the SAME feature matrix; only the label column changes.
+      build_rows_for_rule_mining() emits one dict per (date, scan_hour, coin) row
+      with columns label_4h, label_6h, label_8h (one per horizon), plus
+      is_train/is_val/is_test split indicators.
+    - Each horizon gets its own rule catalog mined independently on its label
+      (three parallel universes, per user choice).
+    - After mining each horizon, every rule is cross-horizon retested against
+      the OTHER horizons' labels on the SAME rows.
+    """
+    global v2_mining_in_progress, v2_mining_progress, v2_mining_last_result
+
+    if v2_mining_in_progress:
+        log.warning("v2 mining already in progress, skipping")
+        return
+    v2_mining_in_progress = True
+    v2_mining_progress = {"phase":"starting","pct":0,
+        "message":"Starting rule mining...",
+        "params":{"threshold_pct":threshold_pct,
+                   "horizon_hours":horizon_hours_list,
+                   "methods":list(methods)}}
+
+    try:
+        # ── Step 1: Load bars (reuse v1 cache if fresh) ──
+        daily_age = cache_age_hours(BARS_DAILY_CACHE)
+        intra_age = cache_age_hours(BARS_INTRADAY_CACHE)
+        if not (daily_age < CACHE_MAX_AGE_HOURS and intra_age < CACHE_MAX_AGE_HOURS):
+            _v2_rules_progress_cb(2, "Fetching fresh bars from Coinbase...")
+            client = cb_client()
+            end_dt = now_utc().replace(minute=0, second=0, microsecond=0)
+            start_dt = end_dt - timedelta(days=TRAIN_DAYS)
+            fetch_products = list(set(PRODUCTS + [BENCHMARK]))
+            daily = fetch_candles_bulk(client, fetch_products, start_dt, end_dt, 86400)
+            intraday = fetch_candles_bulk(
+                client, fetch_products, start_dt, end_dt, CANDLE_GRANULARITY)
+            client.close()
+            BARS_DAILY_CACHE.write_bytes(pickle.dumps(daily))
+            BARS_INTRADAY_CACHE.write_bytes(pickle.dumps(intraday))
+        else:
+            _v2_rules_progress_cb(2, f"Loading cached bars (age {intra_age:.1f}h)...")
+            daily = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+            intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+
+        # ── Step 2: Build ONE row dataset with labels for all horizons ──
+        def row_progress(p, m):
+            # Rows phase: 5%..40% of overall progress
+            _v2_rules_progress_cb(5 + int(p * 0.35), f"[rows] {m}")
+
+        rows, split_info = v2_module.build_rows_for_rule_mining(
+            intraday_bars=intraday,
+            daily_bars=daily,
+            products=PRODUCTS,
+            categories=CATEGORIES,
+            benchmark=BENCHMARK,
+            scan_hours=SCAN_HOURS,
+            horizon_hours_list=horizon_hours_list,
+            pct_threshold=threshold_pct,
+            progress_cb=row_progress,
+        )
+        log.info(f"Rows built: {len(rows)} total. "
+                 f"train={split_info['n_train']} val={split_info['n_val']} test={split_info['n_test']}")
+
+        # ── Step 3: Mine rules per horizon ──
+        # feature_names to mine over: all v2 features EXCEPT those in EXCLUDE_FROM_MINING.
+        # We pass the full list and v2_rules filters inside build_binned_dataframe.
+        feature_names = list(v2_module.FEATURE_NAMES_V2)
+
+        all_catalogs = []
+        n_horizons = len(horizon_hours_list)
+        for hi, hh in enumerate(horizon_hours_list):
+            def mine_progress(p, m, _hi=hi, _hh=hh):
+                base = 40 + int((_hi / n_horizons) * 55)
+                scale = 55 / n_horizons
+                _v2_rules_progress_cb(base + int(p * scale / 100),
+                                       f"[h={_hh}] {m}")
+
+            winner_col = f"label_{hh}h"
+            _v2_rules_progress_cb(40 + int((hi / n_horizons) * 55),
+                                   f"[h={hh}] Mining rules...")
+
+            result = v2_rules_module.mine_all_for_cell(
+                rows=rows,
+                feature_names=feature_names,
+                winner_column=winner_col,
+                split_cols={"train": "is_train", "val": "is_val", "test": "is_test"},
+                min_precision=min_precision,
+                min_support_frac=max(0.001, min_support / max(1, split_info["n_train"])),
+                min_lift=min_lift,
+                methods=tuple(methods),
+                progress_cb=mine_progress,
+            )
+
+            # Cross-horizon retest: evaluate every rule against every OTHER horizon
+            # using the same rows but a different label column. Build the binned
+            # feature matrix ONCE (identical across horizons) and reuse it for
+            # all rules and all other-horizon labels.
+            import pandas as _pd
+            import numpy as _np
+            df_for_retest = _pd.DataFrame(rows)
+            binned_df_rt, _, _ = v2_rules_module.build_binned_dataframe(
+                df_for_retest, feature_names,
+                df_for_retest["is_train"].astype(bool).values)
+            test_mask_rt = df_for_retest["is_test"].astype(bool).values
+            for r in result["rules"]:
+                r["cross_horizon"] = {}
+                mask = v2_rules_module.rule_to_mask(r, binned_df_rt)
+                for hh_other in horizon_hours_list:
+                    if hh_other == hh: continue
+                    other_col = f"label_{hh_other}h"
+                    labels_other = df_for_retest[other_col].astype(int).values
+                    ev = v2_rules_module.evaluate_rule(mask & test_mask_rt, labels_other)
+                    base_rate_other = float(labels_other[test_mask_rt].mean()) \
+                                      if test_mask_rt.sum() > 0 else 0.0
+                    r["cross_horizon"][f"h_{hh_other}"] = {
+                        "precision": round(ev["precision"], 4),
+                        "support": ev["support"],
+                        "lift_vs_base": round(ev["precision"] - base_rate_other, 4),
+                        "base_rate": round(base_rate_other, 4),
+                    }
+
+            # Persist catalog to disk
+            threshold_bps = int(round(threshold_pct * 10000))
+            catalog_path = V2_RULES_DIR / f"rules_t{threshold_bps}_h{hh}.json"
+            catalog_data = {
+                "threshold_pct": threshold_pct,
+                "horizon_hours": hh,
+                "label_column": winner_col,
+                "mined_at": datetime.now(UTC).isoformat(),
+                "methods": list(methods),
+                "min_precision": min_precision,
+                "min_support": min_support,
+                "min_lift": min_lift,
+                "base_rates": result["base_rates"],
+                "bin_edges": result["bin_edges"],
+                "bin_labels": result["bin_labels"],
+                "stats": result["stats"],
+                "split_info": split_info,
+                "rules": result["rules"],
+            }
+            catalog_path.write_text(json.dumps(catalog_data, indent=2, default=str))
+            log.info(f"[h={hh}] Saved {catalog_path.name} ({len(result['rules'])} rules)")
+
+            all_catalogs.append({
+                "threshold_pct": threshold_pct,
+                "threshold_bps": threshold_bps,
+                "horizon_hours": hh,
+                "rule_count": len(result["rules"]),
+                "filename": catalog_path.name,
+                "base_rate_test": round(result["base_rates"]["test"], 4),
+            })
+
+        v2_mining_last_result = {
+            "threshold_pct": threshold_pct,
+            "horizons": horizon_hours_list,
+            "catalogs": all_catalogs,
+            "completed_at": datetime.now(UTC).isoformat(),
+        }
+        v2_mining_progress = {"phase":"done","pct":100,
+            "message":f"Done. {sum(c['rule_count'] for c in all_catalogs)} rules across "
+                      f"{len(all_catalogs)} horizon(s).",
+            "params":v2_mining_progress.get("params"),
+            "result": v2_mining_last_result}
+
+    except Exception as e:
+        log.exception(f"v2 mining failed: {e}")
+        v2_mining_progress = {"phase":"error","pct":0,
+            "message":f"Error: {e}",
+            "params":v2_mining_progress.get("params")}
+    finally:
+        v2_mining_in_progress = False
+
+
+class V2MineRequest(BaseModel):
+    threshold_pct: float = 0.02        # e.g. 0.02 for +2%
+    horizon_hours: list = [4, 6, 8]
+    methods: list = ["univariate", "tree", "apriori"]
+    min_precision: float = 0.65
+    min_support: int = 30
+    min_lift: float = 0.03
+
+@app.post("/api/v2/mine_rules")
+def v2_mine_rules(bg: BackgroundTasks, req: V2MineRequest):
+    if v2_mining_in_progress:
+        return JSONResponse({"status":"already_running",
+            "progress":v2_mining_progress}, 409)
+    if v2_training_in_progress:
+        return JSONResponse({"error":"v2 training in progress — wait for it"}, 409)
+
+    # Validation
+    if not (0.005 <= req.threshold_pct <= 0.20):
+        return JSONResponse({"error":"threshold_pct must be 0.005-0.20"}, 400)
+    if not req.horizon_hours or not all(1 <= h <= 72 for h in req.horizon_hours):
+        return JSONResponse({"error":"horizon_hours must be list of 1-72"}, 400)
+    valid_methods = {"univariate","tree","apriori"}
+    if not req.methods or not set(req.methods).issubset(valid_methods):
+        return JSONResponse({"error":f"methods must be subset of {valid_methods}"}, 400)
+    if not (0.3 <= req.min_precision <= 0.99):
+        return JSONResponse({"error":"min_precision must be 0.3-0.99"}, 400)
+    if not (1 <= req.min_support <= 10000):
+        return JSONResponse({"error":"min_support must be 1-10000"}, 400)
+    if not (0.0 <= req.min_lift <= 0.5):
+        return JSONResponse({"error":"min_lift must be 0.0-0.5"}, 400)
+
+    bg.add_task(_v2_run_mining,
+                req.threshold_pct, req.horizon_hours, req.methods,
+                req.min_precision, req.min_support, req.min_lift)
+    return {"status":"started",
+            "threshold_pct":req.threshold_pct,
+            "horizon_hours":req.horizon_hours,
+            "methods":req.methods}
+
+@app.get("/api/v2/mine_rules/progress")
+def v2_mining_progress_get():
+    return {"inProgress": v2_mining_in_progress, **v2_mining_progress}
+
+@app.get("/api/v2/rules/catalogs")
+def v2_list_catalogs():
+    """List all rule catalogs (one per threshold,horizon pair)."""
+    catalogs = []
+    for p in sorted(V2_RULES_DIR.glob("rules_t*_h*.json")):
+        try:
+            d = json.loads(p.read_text())
+            catalogs.append({
+                "threshold_pct": d.get("threshold_pct"),
+                "threshold_bps": int(round(d.get("threshold_pct", 0) * 10000)),
+                "horizon_hours": d.get("horizon_hours"),
+                "rule_count": len(d.get("rules", [])),
+                "mined_at": d.get("mined_at"),
+                "filename": p.name,
+                "base_rate_test": round(d.get("base_rates", {}).get("test", 0), 4),
+                "methods": d.get("methods", []),
+            })
+        except Exception as e:
+            log.warning(f"catalog list: skipping {p.name}: {e}")
+    return {"catalogs": catalogs}
+
+@app.get("/api/v2/rules/catalog/{threshold_bps}/{horizon_hours}")
+def v2_get_catalog(threshold_bps: int, horizon_hours: int):
+    """
+    Get a full catalog. threshold_bps = threshold in basis-points*10
+    (e.g. 200 = 2.00%, 150 = 1.50%). Integer URL keys avoid float routing
+    issues. Returns everything: rules, bin_edges, bin_labels, stats.
+    """
+    path = V2_RULES_DIR / f"rules_t{threshold_bps}_h{horizon_hours}.json"
+    if not path.exists():
+        return JSONResponse({"error":"no catalog for this threshold/horizon",
+                              "path": path.name}, 404)
+    try:
+        return JSONResponse(json.loads(path.read_text()))
+    except Exception as e:
+        return JSONResponse({"error":f"catalog read failed: {e}"}, 500)
+
+@app.get("/api/v2/rules/rule/{threshold_bps}/{horizon_hours}/{rule_id}")
+def v2_get_rule(threshold_bps: int, horizon_hours: int, rule_id: str):
+    """Full detail of a single rule by its ID."""
+    path = V2_RULES_DIR / f"rules_t{threshold_bps}_h{horizon_hours}.json"
+    if not path.exists():
+        return JSONResponse({"error":"no catalog"}, 404)
+    try:
+        d = json.loads(path.read_text())
+    except Exception as e:
+        return JSONResponse({"error":f"catalog read failed: {e}"}, 500)
+    for r in d.get("rules", []):
+        if r.get("id") == rule_id:
+            # Attach the bin_labels map so the UI can render conditions nicely
+            return JSONResponse({"rule": r, "bin_labels": d.get("bin_labels", {}),
+                                  "bin_edges": d.get("bin_edges", {}),
+                                  "base_rates": d.get("base_rates", {}),
+                                  "threshold_pct": d.get("threshold_pct"),
+                                  "horizon_hours": d.get("horizon_hours")})
+    return JSONResponse({"error":"rule not found","rule_id":rule_id}, 404)
+
+@app.delete("/api/v2/rules/catalog/{threshold_bps}/{horizon_hours}")
+def v2_delete_catalog(threshold_bps: int, horizon_hours: int):
+    """Delete a single catalog file — useful when you want to re-mine fresh."""
+    path = V2_RULES_DIR / f"rules_t{threshold_bps}_h{horizon_hours}.json"
+    if not path.exists():
+        return JSONResponse({"error":"no such catalog"}, 404)
+    path.unlink()
+    return {"deleted": path.name}
+
+@app.get("/api/v2/rules/diagnostic")
+def v2_rules_diagnostic():
+    """All catalogs in one downloadable JSON."""
+    catalogs = []
+    for p in sorted(V2_RULES_DIR.glob("rules_t*_h*.json")):
+        try:
+            catalogs.append(json.loads(p.read_text()))
+        except Exception as e:
+            log.warning(f"rules diagnostic: skipping {p.name}: {e}")
+    return JSONResponse({
+        "_type": "coinbase_scanner_v2_rules_diagnostic",
+        "_version": "v2.0_stage2",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "universe_size": len(PRODUCTS),
+        "benchmark": BENCHMARK,
+        "n_features": len(v2_module.FEATURE_NAMES_V2),
+        "feature_names": v2_module.FEATURE_NAMES_V2,
+        "catalogs": catalogs,
+    }, headers={"Content-Disposition":
+        f'attachment; filename="coinbase_v2_rules_diagnostic_{today_utc()}.json"'})
+
 # SPA fallback
 dist_path = Path(__file__).parent / "dist"
 if dist_path.exists():

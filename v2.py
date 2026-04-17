@@ -843,7 +843,7 @@ def run_train_cell_v2(k_atr, horizon_hours, intraday_bars, daily_bars,
                 date_cats.append(categories.get(product, "?"))
                 date_dv.append(sum(b["v"]*b["c"] for b in feat_bars[-20:]))
 
-            if len(date_feats) >= 10:
+            if len(date_feats) >= 3:
                 add_cross_sectional_features_v2(date_feats, date_cats, date_dv)
                 for j in range(len(date_feats)):
                     date_feats[j]["label"] = date_meta[j]["label"]
@@ -999,3 +999,209 @@ def run_train_cell_v2(k_atr, horizon_hours, intraday_bars, daily_bars,
              f"prec@0.75 {precision_at['0.75']['precision']} "
              f"(n={precision_at['0.75']['n_predictions']})")
     return meta
+
+# ═══════════════════════════════════════════════════════════════════
+# ROW BUILDER for rule mining — features + multi-horizon ABSOLUTE% labels
+# ═══════════════════════════════════════════════════════════════════
+
+def did_touch_absolute(entry_price, future_bars, pct_threshold, horizon_bars):
+    """
+    Returns 1 if any bar's HIGH in future_bars[:horizon_bars] reaches
+    entry_price * (1 + pct_threshold). Wicks count.
+
+    Differs from did_touch_threshold: uses a fixed absolute percentage
+    (e.g., 0.02 = +2%), NOT k*ATR. This is what the rule-mining framework
+    uses because the user prefers a concrete, tradeable target.
+    """
+    target = entry_price * (1.0 + pct_threshold)
+    window = future_bars[:horizon_bars]
+    for b in window:
+        if b["h"] >= target:
+            return 1
+    return 0
+
+
+def build_rows_for_rule_mining(intraday_bars, daily_bars, products, categories,
+                                benchmark, scan_hours, horizon_hours_list,
+                                pct_threshold, progress_cb=None):
+    """
+    Build a DataFrame-ready list of rows for rule mining.
+
+    Each row = one (date, scan_hour, coin) sample, containing:
+      • all 53 features from compute_features_v2()
+      • 'label_{H}h' columns: binary, 1 if coin hit +pct_threshold within H hours
+      • 'date', 'scan_hour', 'product' for splitting and display
+      • 'is_train', 'is_val', 'is_test': purged time-series split indicators
+        (embargo = ceil(max_horizon / 24) days)
+
+    Returns: (rows, split_info) where split_info has train/val/test date sets.
+    """
+    def prog(p, m):
+        if progress_cb: progress_cb(p, m)
+        log.info(f"[row build] {p}% — {m}")
+
+    max_horizon_hours = max(horizon_hours_list)
+    max_horizon_bars = int(max_horizon_hours * BARS_PER_HOUR)
+    horizon_bars_map = {H: int(H * BARS_PER_HOUR) for H in horizon_hours_list}
+
+    prog(5, "Grouping bars by date...")
+    by_td = defaultdict(lambda: defaultdict(list))
+    for product in list(products) + [benchmark]:
+        for b in intraday_bars.get(product, []):
+            by_td[product][b["t"][:10]].append(b)
+
+    all_dates = sorted(set(d for t in by_td for d in by_td[t]))
+    if len(all_dates) < MIN_HISTORY_DAYS:
+        raise ValueError(f"Only {len(all_dates)} days of data, need >= {MIN_HISTORY_DAYS}")
+
+    prog(10, f"Building rows across {len(all_dates)} dates × {len(scan_hours)} slots...")
+    rows = []
+    n_dates = len(all_dates)
+
+    for di, date in enumerate(all_dates):
+        for scan_hour in scan_hours:
+            scan_min = scan_hour * 60
+
+            # BTC context up to scan time on this date
+            btc_day = by_td[benchmark].get(date, [])
+            btc_before_today = []
+            for b in btc_day:
+                try:
+                    dt = datetime.fromisoformat(b["t"].replace("Z","+00:00")).astimezone(UTC)
+                    if dt.hour * 60 + dt.minute < scan_min:
+                        btc_before_today.append(b)
+                except:
+                    continue
+            btc_earlier = []
+            for d2 in all_dates:
+                if d2 >= date: break
+                btc_earlier.extend(by_td[benchmark].get(d2, []))
+            btc_history = btc_earlier + btc_before_today
+            if len(btc_history) < 50: continue
+            btc_atr = compute_atr_fraction(btc_history)
+            btc_ctx = compute_btc_context_v2(btc_history[-48:], btc_atr)
+
+            date_feats, date_meta, date_cats, date_dv = [], [], [], []
+
+            for product in products:
+                day_bars = by_td[product].get(date, [])
+                if len(day_bars) < 4: continue
+
+                before_today, after_today = [], []
+                for b in day_bars:
+                    try:
+                        dt = datetime.fromisoformat(b["t"].replace("Z","+00:00")).astimezone(UTC)
+                        bm = dt.hour * 60 + dt.minute
+                        if bm < scan_min: before_today.append(b)
+                        else: after_today.append(b)
+                    except: continue
+
+                earlier = []
+                for d2 in all_dates:
+                    if d2 >= date: break
+                    earlier.extend(by_td[product].get(d2, []))
+                history = earlier + before_today
+                if len(history) < MIN_BARS_FOR_FEATURES: continue
+
+                feat_bars = history[-FEATURE_LOOKBACK_BARS:]
+                atr_frac = compute_atr_fraction(history)
+
+                # Need enough future bars to evaluate the LONGEST horizon label
+                after_bars = list(after_today)
+                if len(after_bars) < max_horizon_bars + 1:
+                    try:
+                        idx_today = all_dates.index(date)
+                    except:
+                        idx_today = -1
+                    if idx_today >= 0:
+                        for di2 in range(idx_today + 1, len(all_dates)):
+                            if len(after_bars) >= max_horizon_bars + 1: break
+                            after_bars.extend(by_td[product].get(all_dates[di2], []))
+                if len(after_bars) < max_horizon_bars + 1: continue
+
+                entry_price = after_bars[0]["o"]
+                current_price = feat_bars[-1]["c"]
+                open_price = day_bars[0]["o"]
+
+                feat = compute_features_v2(
+                    feat_bars, daily_bars.get(product, []),
+                    current_price, open_price, scan_hour,
+                    btc_bars_before=btc_history[-50:], btc_context=btc_ctx,
+                    atr_frac=atr_frac,
+                )
+                if feat is None: continue
+
+                # Compute labels for each horizon
+                for H in horizon_hours_list:
+                    feat[f"label_{H}h"] = did_touch_absolute(
+                        entry_price, after_bars[1:], pct_threshold, horizon_bars_map[H])
+
+                date_feats.append(feat)
+                date_meta.append({"product": product, "date": date, "scan_hour": scan_hour,
+                                  "entry_price": entry_price, "atr_frac": atr_frac})
+                date_cats.append(categories.get(product, "?"))
+                date_dv.append(sum(b["v"] * b["c"] for b in feat_bars[-20:]))
+
+            # Require at least 3 coins per date for cross-sectional features
+            # to be meaningful. In production (~130 coins) this easily clears.
+            if len(date_feats) >= 3:
+                add_cross_sectional_features_v2(date_feats, date_cats, date_dv)
+                for j in range(len(date_feats)):
+                    for mk, mv in date_meta[j].items():
+                        date_feats[j][mk] = mv
+                    rows.append(date_feats[j])
+
+        if (di + 1) % 20 == 0:
+            prog(10 + int((di / n_dates) * 60),
+                 f"Processed {di+1}/{n_dates} dates ({len(rows)} rows)...")
+
+    if len(rows) < 500:
+        raise ValueError(f"Only {len(rows)} rows, need >= 500")
+
+    # Purged time-series split using MAX horizon for embargo
+    prog(80, "Computing train/val/test split...")
+    dates_sorted = sorted(set(r["date"] for r in rows))
+    n_days = len(dates_sorted)
+    embargo_days = max(1, int(math.ceil(max_horizon_hours / 24)))
+    train_end = int(n_days * 0.6)
+    val_start = train_end + embargo_days
+    val_end = val_start + int(n_days * 0.2)
+    test_start = val_end + embargo_days
+    if test_start >= n_days - 2:
+        train_end = max(1, int(n_days * 0.55))
+        val_start = train_end + embargo_days
+        val_end = val_start + max(1, int(n_days * 0.2))
+        test_start = val_end + embargo_days
+
+    train_dates = set(dates_sorted[:train_end])
+    val_dates = set(dates_sorted[val_start:val_end])
+    test_dates = set(dates_sorted[test_start:])
+
+    for r in rows:
+        r["is_train"] = r["date"] in train_dates
+        r["is_val"] = r["date"] in val_dates
+        r["is_test"] = r["date"] in test_dates
+
+    prog(100, f"Built {len(rows)} rows. "
+              f"Split: train {len(train_dates)}d / val {len(val_dates)}d / test {len(test_dates)}d "
+              f"(embargo {embargo_days}d)")
+
+    split_info = {
+        "n_train": sum(1 for r in rows if r["is_train"]),
+        "n_val": sum(1 for r in rows if r["is_val"]),
+        "n_test": sum(1 for r in rows if r["is_test"]),
+        "train_days": len(train_dates),
+        "val_days": len(val_dates),
+        "test_days": len(test_dates),
+        "embargo_days": embargo_days,
+        "base_rates": {
+            f"label_{H}h": {
+                "train": sum(r[f"label_{H}h"] for r in rows if r["is_train"]) / max(1, sum(1 for r in rows if r["is_train"])),
+                "val":   sum(r[f"label_{H}h"] for r in rows if r["is_val"])   / max(1, sum(1 for r in rows if r["is_val"])),
+                "test":  sum(r[f"label_{H}h"] for r in rows if r["is_test"])  / max(1, sum(1 for r in rows if r["is_test"])),
+            }
+            for H in horizon_hours_list
+        },
+    }
+
+    return rows, split_info

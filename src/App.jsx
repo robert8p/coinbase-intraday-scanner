@@ -858,10 +858,653 @@ function V2Tab() {
   );
 }
 
+// ─── RULES (v2 Stage 2) ──────────────────────────────────────────
+// Rule mining UI. Three parts:
+//   1. Mine panel — configure & trigger a rule mining run
+//   2. Catalogs list — one per (threshold, horizon); click to load its rules
+//   3. Rules table + detail — sortable/paginated; click a row to see full detail
+//
+// Rule mining is always scoped to ONE threshold at a time. Within a run, each
+// horizon (4h/6h/8h by default) gets an independent catalog. Cross-horizon
+// retest is annotated inside each rule so the user can see if a rule found
+// on h=4 also holds at h=6 or h=8.
+
+function RulesTab() {
+  // Mine panel state
+  const [thresholdPct, setThresholdPct] = useState(2.0);   // percent (not fraction)
+  const [horizons, setHorizons] = useState({4:true, 6:true, 8:true});
+  const [methods, setMethods] = useState({univariate:true, tree:true, apriori:true});
+  const [minPrec, setMinPrec] = useState(0.65);
+  const [minSup, setMinSup] = useState(30);
+  const [minLift, setMinLift] = useState(0.05);
+  const [progress, setProgress] = useState(null);
+  const [error, setError] = useState(null);
+
+  // Catalogs list
+  const [catalogs, setCatalogs] = useState([]);
+  const [selectedCatalog, setSelectedCatalog] = useState(null);  // {threshold_bps, horizon_hours}
+  const [catalogDetail, setCatalogDetail] = useState(null);
+
+  // Rules table
+  const [sortKey, setSortKey] = useState("test_precision");
+  const [sortDir, setSortDir] = useState("desc");
+  const [page, setPage] = useState(0);
+  const [pageSize] = useState(25);
+  const [selectedRuleId, setSelectedRuleId] = useState(null);
+  const [ruleDetail, setRuleDetail] = useState(null);
+
+  // Poll progress + catalogs
+  useEffect(() => {
+    const fetchState = () => {
+      fetch('/api/v2/mine_rules/progress').then(r => r.json()).then(setProgress).catch(() => {});
+      fetch('/api/v2/rules/catalogs').then(r => r.json())
+        .then(d => setCatalogs(d.catalogs || [])).catch(() => {});
+    };
+    fetchState();
+    const iv = setInterval(fetchState, 3000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Load catalog detail when selected
+  useEffect(() => {
+    if (!selectedCatalog) return setCatalogDetail(null);
+    const {threshold_bps, horizon_hours} = selectedCatalog;
+    setCatalogDetail(null);
+    setPage(0);
+    setSelectedRuleId(null);
+    setRuleDetail(null);
+    fetch(`/api/v2/rules/catalog/${threshold_bps}/${horizon_hours}`)
+      .then(r => r.json()).then(setCatalogDetail).catch(e => setCatalogDetail({error: e.message}));
+  }, [selectedCatalog]);
+
+  // Load rule detail when selected
+  useEffect(() => {
+    if (!selectedRuleId || !selectedCatalog) return setRuleDetail(null);
+    const {threshold_bps, horizon_hours} = selectedCatalog;
+    setRuleDetail(null);
+    fetch(`/api/v2/rules/rule/${threshold_bps}/${horizon_hours}/${selectedRuleId}`)
+      .then(r => r.json()).then(setRuleDetail).catch(e => setRuleDetail({error: e.message}));
+  }, [selectedRuleId, selectedCatalog]);
+
+  const startMining = useCallback(async () => {
+    setError(null);
+    const horizonList = Object.keys(horizons).filter(h => horizons[h]).map(h => parseInt(h));
+    const methodList = Object.keys(methods).filter(m => methods[m]);
+    if (horizonList.length === 0) { setError("Pick at least one horizon"); return; }
+    if (methodList.length === 0) { setError("Pick at least one method"); return; }
+    try {
+      const r = await fetch('/api/v2/mine_rules', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({
+          threshold_pct: thresholdPct / 100,
+          horizon_hours: horizonList,
+          methods: methodList,
+          min_precision: minPrec,
+          min_support: minSup,
+          min_lift: minLift,
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (d.status === "already_running") setError("Mining already in progress");
+    } catch (e) { setError(e.message); }
+  }, [thresholdPct, horizons, methods, minPrec, minSup, minLift]);
+
+  const deleteCatalog = useCallback(async (threshold_bps, horizon_hours) => {
+    if (!confirm(`Delete catalog for threshold_bps=${threshold_bps}, horizon=${horizon_hours}h?`)) return;
+    try {
+      const r = await fetch(`/api/v2/rules/catalog/${threshold_bps}/${horizon_hours}`, {method: 'DELETE'});
+      if (!r.ok) { const d = await r.json(); throw new Error(d.error); }
+      // Refresh catalogs list
+      const rr = await fetch('/api/v2/rules/catalogs'); const dd = await rr.json();
+      setCatalogs(dd.catalogs || []);
+      if (selectedCatalog && selectedCatalog.threshold_bps === threshold_bps &&
+          selectedCatalog.horizon_hours === horizon_hours) {
+        setSelectedCatalog(null);
+      }
+    } catch (e) { alert(e.message); }
+  }, [selectedCatalog]);
+
+  const downloadDiagnostic = useCallback(async () => {
+    try {
+      const r = await fetch('/api/v2/rules/diagnostic');
+      const b = await r.blob();
+      const fn = r.headers.get('content-disposition')?.match(/filename="(.+)"/)?.[1] || 'rules_diag.json';
+      const u = URL.createObjectURL(b);
+      const a = document.createElement('a');
+      a.href = u; a.download = fn;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a); URL.revokeObjectURL(u);
+    } catch (e) { alert(e.message); }
+  }, []);
+
+  const ip = progress?.inProgress;
+  const phase = progress?.phase;
+
+  // Color code precision: green >= 0.70, yellow 0.55-0.70, red < 0.55
+  const precColor = (p) => {
+    if (p == null) return "#64748b";
+    if (p >= 0.70) return "#22c55e";
+    if (p >= 0.55) return "#eab308";
+    return "#ef4444";
+  };
+
+  // Sort/paginate rules
+  const rules = catalogDetail?.rules || [];
+  const sortedRules = [...rules].sort((a, b) => {
+    let av, bv;
+    if (sortKey === "test_precision") { av = a.test?.precision ?? 0; bv = b.test?.precision ?? 0; }
+    else if (sortKey === "train_precision") { av = a.train?.precision ?? 0; bv = b.train?.precision ?? 0; }
+    else if (sortKey === "test_support") { av = a.test?.support ?? 0; bv = b.test?.support ?? 0; }
+    else if (sortKey === "lift") { av = a.test?.lift_vs_base ?? 0; bv = b.test?.lift_vs_base ?? 0; }
+    else if (sortKey === "gap") { av = a.train_test_gap ?? 0; bv = b.train_test_gap ?? 0; }
+    else if (sortKey === "n_conds") { av = a.conditions?.length ?? 0; bv = b.conditions?.length ?? 0; }
+    else { av = 0; bv = 0; }
+    return sortDir === "desc" ? (bv - av) : (av - bv);
+  });
+  const pageStart = page * pageSize;
+  const pageEnd = Math.min(pageStart + pageSize, sortedRules.length);
+  const pageRules = sortedRules.slice(pageStart, pageEnd);
+  const totalPages = Math.ceil(sortedRules.length / pageSize);
+
+  const clickHeader = (k) => {
+    if (sortKey === k) setSortDir(sortDir === "desc" ? "asc" : "desc");
+    else { setSortKey(k); setSortDir("desc"); }
+    setPage(0);
+  };
+
+  // Compact rule-condition display for table row
+  const condSummary = (r) => {
+    const n = r.conditions?.length ?? 0;
+    const feats = (r.conditions || []).map(c => c.feature).slice(0, 3);
+    return `${n} cond: ${feats.join(", ")}${n > 3 ? "..." : ""}`;
+  };
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+      {/* ── BANNER ── */}
+      <Box>
+        <div style={{fontSize:11,color:"#8b5cf6",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6,fontWeight:700}}>
+          v2 Stage 2 — Rule Mining
+        </div>
+        <div style={{fontSize:12,color:"#94a3b8",lineHeight:1.6}}>
+          Mines interpretable setups from historical data. Three methods run in parallel per horizon:{" "}
+          <span style={{color:"#e2e8f0"}}>univariate</span> (single-feature thresholds),{" "}
+          <span style={{color:"#e2e8f0"}}>decision trees</span> (multi-feature, precision-optimized leaves),{" "}
+          <span style={{color:"#e2e8f0"}}>apriori</span> (frequent feature-bin combinations).
+          Each horizon gets its own catalog. Every rule is cross-horizon retested to see if it generalizes.
+          Absolute +X% threshold (not vol-normalized).
+        </div>
+      </Box>
+
+      {/* ── MINE PANEL ── */}
+      <Box>
+        <Lbl>Mine Rules</Lbl>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(240px, 1fr))",gap:16,marginBottom:12}}>
+          {/* Threshold */}
+          <div>
+            <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6}}>Threshold (+%)</div>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <input type="number" step="0.1" min="0.5" max="20" value={thresholdPct}
+                onChange={e => setThresholdPct(parseFloat(e.target.value) || 2.0)}
+                disabled={ip}
+                style={{width:70,padding:"4px 6px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:4,color:"#e2e8f0",fontFamily:F,fontSize:12}}/>
+              <span style={{fontSize:11,color:"#475569"}}>% (e.g., 2.0 = +2%)</span>
+            </div>
+          </div>
+
+          {/* Horizons */}
+          <div>
+            <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6}}>Horizons (hours)</div>
+            <div style={{display:"flex",gap:10}}>
+              {[2,4,6,8,12,24].map(h => (
+                <label key={h} style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:ip?"not-allowed":"pointer",opacity:ip?0.5:1}}>
+                  <input type="checkbox" checked={!!horizons[h]}
+                    onChange={e => setHorizons(s => ({...s, [h]: e.target.checked}))}
+                    disabled={ip}/>
+                  <span style={{color:horizons[h]?"#e2e8f0":"#64748b"}}>{h}h</span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* Methods */}
+          <div>
+            <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6}}>Methods</div>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+              {["univariate","tree","apriori"].map(m => (
+                <label key={m} style={{display:"flex",alignItems:"center",gap:4,fontSize:12,cursor:ip?"not-allowed":"pointer",opacity:ip?0.5:1}}>
+                  <input type="checkbox" checked={!!methods[m]}
+                    onChange={e => setMethods(s => ({...s, [m]: e.target.checked}))}
+                    disabled={ip}/>
+                  <span style={{color:methods[m]?"#e2e8f0":"#64748b"}}>{m}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit, minmax(220px, 1fr))",gap:16,marginBottom:12}}>
+          {/* min precision */}
+          <div>
+            <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6}}>
+              Min precision: <span style={{color:"#e2e8f0"}}>{(minPrec*100).toFixed(0)}%</span>
+            </div>
+            <input type="range" min="0.3" max="0.95" step="0.01" value={minPrec}
+              onChange={e => setMinPrec(parseFloat(e.target.value))} disabled={ip}
+              style={{width:"100%"}}/>
+            <div style={{fontSize:10,color:"#475569",marginTop:2}}>Rules below this are discarded</div>
+          </div>
+
+          {/* min support */}
+          <div>
+            <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6}}>
+              Min support: <span style={{color:"#e2e8f0"}}>{minSup}</span>
+            </div>
+            <input type="number" step="1" min="5" max="5000" value={minSup}
+              onChange={e => setMinSup(parseInt(e.target.value) || 30)} disabled={ip}
+              style={{width:"100%",padding:"4px 6px",background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:4,color:"#e2e8f0",fontFamily:F,fontSize:12}}/>
+            <div style={{fontSize:10,color:"#475569",marginTop:2}}>Min rule fires (absolute count)</div>
+          </div>
+
+          {/* min lift */}
+          <div>
+            <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6}}>
+              Min lift: <span style={{color:"#e2e8f0"}}>{(minLift*100).toFixed(1)} pp</span>
+            </div>
+            <input type="range" min="0" max="0.30" step="0.005" value={minLift}
+              onChange={e => setMinLift(parseFloat(e.target.value))} disabled={ip}
+              style={{width:"100%"}}/>
+            <div style={{fontSize:10,color:"#475569",marginTop:2}}>Precision must beat base rate by this</div>
+          </div>
+        </div>
+
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <Btn onClick={startMining} disabled={ip} color="#8b5cf6"
+            style={{padding:"8px 16px",fontSize:12,fontWeight:700}}>
+            {ip ? "Mining..." : "⛏ Mine Rules"}
+          </Btn>
+          <div style={{fontSize:11,color:"#64748b"}}>
+            Takes 5-15 min depending on data volume & horizons
+          </div>
+        </div>
+      </Box>
+
+      {/* ── PROGRESS ── */}
+      <Box>
+        <Lbl>Mining Progress</Lbl>
+        {!progress ? (
+          <div style={{fontSize:12,color:"#475569"}}>Loading...</div>
+        ) : ip ? (
+          <div>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:6}}>
+              <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+                <div style={{width:`${progress.pct||0}%`,height:"100%",background:"#8b5cf6",borderRadius:3,transition:"width 0.5s"}}/>
+              </div>
+              <span style={{fontSize:11,color:"#8b5cf6",fontWeight:600,minWidth:36,textAlign:"right"}}>{progress.pct||0}%</span>
+            </div>
+            <div style={{fontSize:12,color:"#94a3b8"}}>{progress.message}</div>
+          </div>
+        ) : phase === "done" ? (
+          <div style={{fontSize:12,color:"#22c55e"}}>✓ {progress.message}</div>
+        ) : phase === "error" ? (
+          <div style={{fontSize:12,color:"#ef4444"}}>✗ {progress.message}</div>
+        ) : (
+          <div style={{fontSize:12,color:"#475569"}}>Idle</div>
+        )}
+      </Box>
+
+      {error && (
+        <div style={{padding:"8px 12px",borderRadius:6,background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:12}}>
+          {error}
+        </div>
+      )}
+
+      {/* ── CATALOGS ── */}
+      <Box>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <Lbl>Catalogs ({catalogs.length})</Lbl>
+          {catalogs.length > 0 && (
+            <Btn onClick={downloadDiagnostic} color="#f97316" style={{padding:"4px 10px",fontSize:11}}>
+              ⬇ Download all (rules diagnostic)
+            </Btn>
+          )}
+        </div>
+        {catalogs.length === 0 ? (
+          <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
+            No catalogs yet. Click "Mine Rules" above to start.
+          </div>
+        ) : (
+          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {catalogs.map(c => {
+              const sel = selectedCatalog &&
+                selectedCatalog.threshold_bps === c.threshold_bps &&
+                selectedCatalog.horizon_hours === c.horizon_hours;
+              return (
+                <div key={`${c.threshold_bps}_${c.horizon_hours}`}
+                  style={{display:"flex",alignItems:"center",gap:4,
+                    background:sel?"rgba(139,92,246,0.15)":"rgba(255,255,255,0.04)",
+                    border:`1px solid ${sel?"rgba(139,92,246,0.4)":"rgba(255,255,255,0.08)"}`,
+                    borderRadius:4,padding:"6px 10px",fontSize:11}}>
+                  <span onClick={() => setSelectedCatalog({threshold_bps:c.threshold_bps,horizon_hours:c.horizon_hours})}
+                    style={{cursor:"pointer",color:sel?"#e2e8f0":"#94a3b8"}}>
+                    <span style={{color:"#8b5cf6",fontWeight:600}}>+{(c.threshold_pct*100).toFixed(1)}%</span>
+                    {" / "}<span style={{color:"#e2e8f0"}}>{c.horizon_hours}h</span>
+                    {" "}<span style={{color:"#64748b"}}>— {c.rule_count} rules</span>
+                    {" "}<span style={{color:"#475569",fontSize:10}}>base {(c.base_rate_test*100).toFixed(1)}%</span>
+                  </span>
+                  <span onClick={() => deleteCatalog(c.threshold_bps, c.horizon_hours)}
+                    style={{cursor:"pointer",color:"#64748b",marginLeft:4,fontSize:14,fontWeight:700}}
+                    title="Delete catalog">×</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Box>
+
+      {/* ── RULES TABLE ── */}
+      {selectedCatalog && (
+        <Box>
+          {!catalogDetail ? (
+            <div style={{color:"#475569",fontSize:12}}>Loading catalog...</div>
+          ) : catalogDetail.error ? (
+            <div style={{color:"#ef4444",fontSize:12}}>{catalogDetail.error}</div>
+          ) : (
+            <div>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <Lbl>
+                  Rules — +{(catalogDetail.threshold_pct*100).toFixed(1)}% / {catalogDetail.horizon_hours}h
+                  {" "}<span style={{color:"#475569",fontWeight:400}}>
+                    ({sortedRules.length} rules, base rate test {(catalogDetail.base_rates.test*100).toFixed(1)}%)
+                  </span>
+                </Lbl>
+                <div style={{fontSize:10,color:"#475569"}}>
+                  Raw by method: {Object.entries(catalogDetail.stats?.raw_rules_by_method || {}).map(([m,n]) => `${m}:${n}`).join(" · ")}
+                </div>
+              </div>
+
+              {sortedRules.length === 0 ? (
+                <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
+                  No rules in this catalog.{" "}
+                  <span style={{color:"#64748b"}}>
+                    Try lowering min_precision, min_support, or min_lift and re-mining.
+                  </span>
+                </div>
+              ) : (
+                <>
+                  <div style={{overflowX:"auto"}}>
+                    <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                      <thead>
+                        <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+                          <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Methods</th>
+                          <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Conditions</th>
+                          <th onClick={() => clickHeader("train_precision")} style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                            Train P {sortKey==="train_precision"?(sortDir==="desc"?"↓":"↑"):""}
+                          </th>
+                          <th onClick={() => clickHeader("test_precision")} style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                            Test P {sortKey==="test_precision"?(sortDir==="desc"?"↓":"↑"):""}
+                          </th>
+                          <th onClick={() => clickHeader("test_support")} style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                            Test N {sortKey==="test_support"?(sortDir==="desc"?"↓":"↑"):""}
+                          </th>
+                          <th onClick={() => clickHeader("lift")} style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                            Lift {sortKey==="lift"?(sortDir==="desc"?"↓":"↑"):""}
+                          </th>
+                          <th onClick={() => clickHeader("gap")} style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                            Gap {sortKey==="gap"?(sortDir==="desc"?"↓":"↑"):""}
+                          </th>
+                          <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Cross-H</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pageRules.map(r => {
+                          const sel = selectedRuleId === r.id;
+                          return (
+                            <tr key={r.id}
+                              onClick={() => setSelectedRuleId(r.id === selectedRuleId ? null : r.id)}
+                              style={{borderBottom:"1px solid rgba(255,255,255,0.03)",cursor:"pointer",
+                                background:sel?"rgba(139,92,246,0.08)":"transparent"}}>
+                              <td style={{padding:"6px 8px",fontSize:10}}>
+                                {(r.methods||[]).map(m => (
+                                  <span key={m} style={{
+                                    display:"inline-block",padding:"1px 6px",marginRight:3,
+                                    background:m==="tree"?"#1e3a8a":m==="apriori"?"#4c1d95":"#065f46",
+                                    color:"#e2e8f0",borderRadius:3,fontSize:9}}>{m}</span>
+                                ))}
+                              </td>
+                              <td style={{padding:"6px 8px",color:"#94a3b8",fontSize:10,maxWidth:320,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+                                {condSummary(r)}
+                              </td>
+                              <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                                {r.train?.precision != null ? `${(r.train.precision*100).toFixed(1)}%` : "—"}
+                              </td>
+                              <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(r.test?.precision),fontWeight:700}}>
+                                {r.test?.precision != null ? `${(r.test.precision*100).toFixed(1)}%` : "—"}
+                              </td>
+                              <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                                {r.test?.support ?? 0}
+                              </td>
+                              <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",
+                                color:(r.test?.lift_vs_base ?? 0) >= 0.10 ? "#22c55e" : (r.test?.lift_vs_base ?? 0) >= 0.05 ? "#eab308" : "#ef4444"}}>
+                                {r.test?.lift_vs_base != null ? `${(r.test.lift_vs_base*100).toFixed(1)}pp` : "—"}
+                              </td>
+                              <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:r.overfit_flag?"#ef4444":"#64748b"}}>
+                                {r.train_test_gap != null ? `${(r.train_test_gap*100).toFixed(1)}pp${r.overfit_flag?" ⚠":""}` : "—"}
+                              </td>
+                              <td style={{padding:"6px 8px",fontSize:10}}>
+                                {Object.entries(r.cross_horizon || {}).map(([hKey, xh]) => {
+                                  const col = xh.lift_vs_base >= 0.05 ? "#22c55e" :
+                                              xh.lift_vs_base >= 0 ? "#eab308" : "#ef4444";
+                                  return (
+                                    <span key={hKey} style={{display:"inline-block",marginRight:6,color:col,fontVariantNumeric:"tabular-nums"}}
+                                      title={`${hKey}: P=${(xh.precision*100).toFixed(1)}% lift=${(xh.lift_vs_base*100).toFixed(1)}pp n=${xh.support}`}>
+                                      {hKey.replace("h_","")}h:{(xh.precision*100).toFixed(0)}%
+                                    </span>);
+                                })}
+                              </td>
+                            </tr>);
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {totalPages > 1 && (
+                    <div style={{display:"flex",justifyContent:"center",alignItems:"center",gap:6,marginTop:10}}>
+                      <Btn onClick={() => setPage(Math.max(0, page-1))} disabled={page===0} style={{padding:"3px 10px",fontSize:11}}>← Prev</Btn>
+                      <span style={{fontSize:11,color:"#94a3b8"}}>
+                        Page {page+1} of {totalPages} ({pageStart+1}–{pageEnd} of {sortedRules.length})
+                      </span>
+                      <Btn onClick={() => setPage(Math.min(totalPages-1, page+1))} disabled={page>=totalPages-1} style={{padding:"3px 10px",fontSize:11}}>Next →</Btn>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+        </Box>
+      )}
+
+      {/* ── RULE DETAIL ── */}
+      {selectedRuleId && selectedCatalog && (
+        <Box>
+          {!ruleDetail ? (
+            <div style={{color:"#475569",fontSize:12}}>Loading rule detail...</div>
+          ) : ruleDetail.error ? (
+            <div style={{color:"#ef4444",fontSize:12}}>{ruleDetail.error}</div>
+          ) : (
+            (() => {
+              const r = ruleDetail.rule;
+              return (
+                <div>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+                    <div>
+                      <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:4}}>Rule {r.id}</div>
+                      <div style={{fontSize:13,color:"#e2e8f0",lineHeight:1.5,fontFamily:F,maxWidth:900}}>
+                        {r.english}
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:4}}>
+                      {(r.methods||[]).map(m => (
+                        <span key={m} style={{
+                          padding:"2px 8px",
+                          background:m==="tree"?"#1e3a8a":m==="apriori"?"#4c1d95":"#065f46",
+                          color:"#e2e8f0",borderRadius:3,fontSize:10,fontWeight:600}}>{m}</span>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+                    {/* Left: metrics across splits */}
+                    <div>
+                      <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:8}}>Metrics</div>
+                      <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                        <thead>
+                          <tr style={{borderBottom:"1px solid rgba(255,255,255,0.06)"}}>
+                            <th style={{padding:"4px 6px",textAlign:"left",color:"#64748b",fontSize:10}}>Split</th>
+                            <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Precision</th>
+                            <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Support</th>
+                            <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Lift</th>
+                            <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Recall</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {[["train",r.train],["val",r.val],["test",r.test]].map(([k,m]) => m && (
+                            <tr key={k} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                              <td style={{padding:"4px 6px",color:"#94a3b8",textTransform:"uppercase",fontSize:10}}>{k}</td>
+                              <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(m.precision),fontWeight:600}}>
+                                {(m.precision*100).toFixed(1)}%
+                              </td>
+                              <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>{m.support}</td>
+                              <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:m.lift_vs_base>=0.05?"#22c55e":m.lift_vs_base>=0?"#eab308":"#ef4444"}}>
+                                {(m.lift_vs_base*100).toFixed(1)}pp
+                              </td>
+                              <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                                {(m.recall*100).toFixed(1)}%
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      <div style={{fontSize:10,color:"#64748b",marginTop:6,lineHeight:1.5}}>
+                        Train-test gap: <span style={{color:r.overfit_flag?"#ef4444":"#94a3b8",fontVariantNumeric:"tabular-nums",fontWeight:600}}>
+                          {(r.train_test_gap*100).toFixed(1)}pp
+                        </span>
+                        {r.overfit_flag && <span style={{color:"#ef4444",marginLeft:6}}>⚠ flagged as likely overfit (gap &gt; 15pp)</span>}
+                      </div>
+
+                      <div style={{marginTop:16}}>
+                        <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:8}}>Cross-horizon retest (test set)</div>
+                        {Object.keys(r.cross_horizon || {}).length === 0 ? (
+                          <div style={{fontSize:11,color:"#475569"}}>No other horizons were mined in this run.</div>
+                        ) : (
+                          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                            <thead>
+                              <tr style={{borderBottom:"1px solid rgba(255,255,255,0.06)"}}>
+                                <th style={{padding:"4px 6px",textAlign:"left",color:"#64748b",fontSize:10}}>Horizon</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Precision</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Base</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Lift</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>N</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {Object.entries(r.cross_horizon).map(([hKey,xh]) => (
+                                <tr key={hKey} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                                  <td style={{padding:"4px 6px",color:"#94a3b8"}}>{hKey.replace("h_","")}h</td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(xh.precision),fontWeight:600}}>
+                                    {(xh.precision*100).toFixed(1)}%
+                                  </td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#475569"}}>
+                                    {(xh.base_rate*100).toFixed(1)}%
+                                  </td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:xh.lift_vs_base>=0.05?"#22c55e":xh.lift_vs_base>=0?"#eab308":"#ef4444"}}>
+                                    {(xh.lift_vs_base*100).toFixed(1)}pp
+                                  </td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>{xh.support}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Right: full conditions + disqualifiers */}
+                    <div>
+                      <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:8}}>Conditions (full)</div>
+                      <div style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.04)",borderRadius:4,padding:10}}>
+                        {(r.conditions||[]).map((c, i) => {
+                          const binLabels = ruleDetail.bin_labels?.[c.feature];
+                          const binStrs = c.bins.map(b =>
+                            binLabels && binLabels[b] ? binLabels[b] : `bin${b}`);
+                          return (
+                            <div key={i} style={{fontSize:11,color:"#e2e8f0",marginBottom:4,fontFamily:F}}>
+                              {i > 0 && <span style={{color:"#64748b"}}>AND </span>}
+                              <span style={{color:"#8b5cf6"}}>{c.feature}</span>
+                              <span style={{color:"#64748b"}}> in </span>
+                              <span>{"{ " + binStrs.join(", ") + " }"}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div style={{marginTop:16}}>
+                        <div style={{fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase",marginBottom:8}}>Disqualifiers (training FPs → TPs)</div>
+                        {!r.disqualifiers || r.disqualifiers.length === 0 ? (
+                          <div style={{fontSize:11,color:"#475569"}}>No disqualifier candidates found.{" "}
+                          <span style={{color:"#64748b"}}>(Need ≥5 TPs and ≥5 FPs on training fires.)</span>
+                          </div>
+                        ) : (
+                          <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                            <thead>
+                              <tr style={{borderBottom:"1px solid rgba(255,255,255,0.06)"}}>
+                                <th style={{padding:"4px 6px",textAlign:"left",color:"#64748b",fontSize:10}}>Exclude if</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Drops FPs</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Drops TPs</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>New P</th>
+                                <th style={{padding:"4px 6px",textAlign:"right",color:"#64748b",fontSize:10}}>Gain</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {r.disqualifiers.slice(0,5).map((d, i) => (
+                                <tr key={i} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                                  <td style={{padding:"4px 6px",color:"#94a3b8",fontFamily:F,fontSize:10}}>{d.condition}</td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#ef4444"}}>{d.excluded_fp}</td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>{d.excluded_tp}</td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(d.new_precision_train),fontWeight:600}}>
+                                    {(d.new_precision_train*100).toFixed(1)}%
+                                  </td>
+                                  <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#22c55e"}}>
+                                    +{(d.precision_gain_train*100).toFixed(1)}pp
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                        <div style={{fontSize:10,color:"#64748b",marginTop:6,lineHeight:1.5}}>
+                          Disqualifiers are computed on <b>training</b> false positives. Add to rule only after retesting on val/test.
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()
+          )}
+        </Box>
+      )}
+    </div>
+  );
+}
+
 // ─── MAIN ────────────────────────────────────────────────────────
 export default function CoinbaseScanner() {
   const [scanHour,setScanHour]=useState(12);
-  const [tab,setTab]=useState("v2");
+  const [tab,setTab]=useState("rules");
   const [data,setData]=useState([]);
   const [source,setSource]=useState("loading");
   const [loading,setLoading]=useState(true);
@@ -901,7 +1544,7 @@ export default function CoinbaseScanner() {
     }catch(e){alert(e.message);}
   },[]);
 
-  const tabs=[{id:"v2",l:"v2 Research",c:"#8b5cf6"},{id:"scanner",l:"Scanner (v1)"},{id:"training",l:"Training (v1)",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes (v1)",c:"#22c55e"},{id:"status",l:"Status"}];
+  const tabs=[{id:"rules",l:"Rules (v2.2)",c:"#8b5cf6"},{id:"v2",l:"v2 Classifier"},{id:"scanner",l:"Scanner (v1)"},{id:"training",l:"Training (v1)",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes (v1)",c:"#22c55e"},{id:"status",l:"Status"}];
 
   return (
     <div style={{fontFamily:F,background:"#0c0f14",color:"#e2e8f0",minHeight:"100vh"}}>
@@ -912,10 +1555,11 @@ export default function CoinbaseScanner() {
         </div>
         <div style={{display:"flex",gap:4,fontSize:11,flexWrap:"wrap",alignItems:"center"}}>
           <span style={{color:"#eab308",fontWeight:600}}>
-            {tab==="v2" ? "v2 — Vol-normalized threshold classifier (Stage 1)" :
+            {tab==="rules" ? "v2 Stage 2 — Rule mining (absolute +%, multi-horizon)" :
+              tab==="v2" ? "v2 — Vol-normalized threshold classifier (Stage 1)" :
               health ? `TP +${health.tp_pct}% / SL -${health.sl_pct}% / ${health.horizonHours||4}h horizon (BE ${health.breakeven}%)` : "Loading..."}
           </span>
-          {lastUpdate&&tab!=="v2"&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
+          {lastUpdate&&tab!=="v2"&&tab!=="rules"&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
         </div>
       </div>
 
@@ -934,6 +1578,7 @@ export default function CoinbaseScanner() {
       {error&&<div style={{margin:"12px 20px 0",padding:"8px 12px",borderRadius:6,background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:12}}>{error}</div>}
 
       <div style={{padding:"16px 20px"}}>
+        {tab==="rules"&&<RulesTab/>}
         {tab==="v2"&&<V2Tab/>}
         {tab==="scanner"&&<ScannerTab data={data} scanHour={scanHour} source={source} elapsed={elapsed} message={message} modelWR10={modelWR10} modelPnL10={modelPnL10} health={health} scanInfo={scanInfo}/>}
         {tab==="training"&&<TrainingTab/>}
