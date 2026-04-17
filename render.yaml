@@ -1,0 +1,22 @@
+services:
+  - type: web
+    runtime: docker
+    name: coinbase-intraday-scanner
+    plan: pro
+    disk:
+      name: scanner-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: COINBASE_API_URL
+        value: https://api.exchange.coinbase.com
+      - key: TRAIN_DAYS
+        value: "180"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      # Optional — only needed if you later switch to an authenticated endpoint
+      # or proxy. Public market data endpoints do not require these.
+      - key: COINBASE_API_KEY
+        sync: false
+      - key: COINBASE_API_SECRET
+        sync: false
