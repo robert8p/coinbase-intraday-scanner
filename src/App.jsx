@@ -1346,12 +1346,62 @@ function RulesTab() {
                         {r.english}
                       </div>
                     </div>
-                    <div style={{display:"flex",gap:4}}>
+                    <div style={{display:"flex",gap:4,alignItems:"center",flexWrap:"wrap"}}>
                       {(r.methods||[]).map(m => (
                         <span key={m} style={{
                           padding:"2px 8px",
                           background:m==="tree"?"#1e3a8a":m==="apriori"?"#4c1d95":"#065f46",
                           color:"#e2e8f0",borderRadius:3,fontSize:10,fontWeight:600}}>{m}</span>
+                      ))}
+                      <Btn
+                        onClick={async () => {
+                          try {
+                            const res = await fetch('/api/v2/live/pin', {
+                              method:'POST',
+                              headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify({
+                                threshold_bps: selectedCatalog.threshold_bps,
+                                horizon_hours: selectedCatalog.horizon_hours,
+                                rule_id: r.id,
+                              }),
+                            });
+                            const d = await res.json();
+                            if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+                            alert(`Pinned to Live (pin_id: ${d.pin.pin_id}).\nGo to the Live tab to see it.`);
+                          } catch (e) { alert(`Pin failed: ${e.message}`); }
+                        }}
+                        color="#22c55e" style={{padding:"3px 10px",fontSize:10,fontWeight:700,marginLeft:6}}>
+                        📌 Pin to Live
+                      </Btn>
+                      {(r.disqualifiers || []).slice(0, 1).map((dq, i) => (
+                        <Btn key={i}
+                          onClick={async () => {
+                            try {
+                              // The "direction" stored on the disqualifier tells us which way
+                              // to exclude. The condition string uses "<=" or ">=" semantics.
+                              const res = await fetch('/api/v2/live/pin', {
+                                method:'POST',
+                                headers:{'Content-Type':'application/json'},
+                                body: JSON.stringify({
+                                  threshold_bps: selectedCatalog.threshold_bps,
+                                  horizon_hours: selectedCatalog.horizon_hours,
+                                  rule_id: r.id,
+                                  disqualifier: {
+                                    feature: dq.feature,
+                                    condition: dq.condition,
+                                    thresh: dq.thresh,
+                                    direction: dq.direction,
+                                  },
+                                }),
+                              });
+                              const d = await res.json();
+                              if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+                              alert(`Pinned with disqualifier (pin_id: ${d.pin.pin_id}).\nSee the Live tab.`);
+                            } catch (e) { alert(`Pin failed: ${e.message}`); }
+                          }}
+                          color="#f97316" style={{padding:"3px 10px",fontSize:10,fontWeight:600}}>
+                          📌 Pin + top DQ
+                        </Btn>
                       ))}
                     </div>
                   </div>
@@ -1501,10 +1551,349 @@ function RulesTab() {
   );
 }
 
+// ─── LIVE (v2 Stage 3) ───────────────────────────────────────────
+// Live scanner + outcome recording dashboard.
+//
+// This tab is the empirical test: pinned rules are evaluated against fresh
+// Coinbase data every 4 hours (matching our scan slot cadence), fires are
+// persisted, and after each rule's horizon elapses, an outcome is recorded.
+// The "live precision" per rule is then compared to the validation precision
+// from the catalog — if they match, the rule is real; if live collapses to
+// base rate, we learn the in-sample validation was measuring noise.
+//
+// Four subsections:
+//   1. Pinned rules overview — validation precision, live precision, delta
+//   2. Recent fires — what fired most recently
+//   3. Scan & resolve controls — manual triggers for scan/outcome jobs
+//   4. Diagnostic download
+
+function LiveTab() {
+  const [pinned, setPinned] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [scanStatus, setScanStatus] = useState(null);
+  const [fires, setFires] = useState([]);
+  const [selectedPin, setSelectedPin] = useState(null);   // pin_id filter for fires
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Poll every 10s for everything; 3s for scan status while active
+  useEffect(() => {
+    const fetchAll = () => {
+      fetch('/api/v2/live/pinned').then(r => r.json())
+        .then(d => setPinned(d.rules || [])).catch(() => {});
+      fetch('/api/v2/live/stats').then(r => r.json()).then(setStats).catch(() => {});
+      fetch('/api/v2/live/scan/status').then(r => r.json()).then(setScanStatus).catch(() => {});
+      const q = selectedPin ? `?pin_id=${encodeURIComponent(selectedPin)}&limit=50` : '?limit=50';
+      fetch(`/api/v2/live/fires${q}`).then(r => r.json())
+        .then(d => setFires(d.fires || [])).catch(() => {});
+    };
+    fetchAll();
+    const iv = setInterval(fetchAll, scanStatus?.inProgress ? 3000 : 10000);
+    return () => clearInterval(iv);
+  }, [selectedPin, scanStatus?.inProgress]);
+
+  const runScanNow = useCallback(async () => {
+    setBusy(true); setError(null);
+    try {
+      const r = await fetch('/api/v2/live/scan', {method: 'POST'});
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (d.status === 'already_in_progress') setError("Scan already in progress");
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }, []);
+
+  const resolveOutcomesNow = useCallback(async () => {
+    setBusy(true); setError(null);
+    try {
+      const r = await fetch('/api/v2/live/record_outcomes', {method: 'POST'});
+      if (!r.ok) { const d = await r.json(); throw new Error(d.error); }
+    } catch (e) { setError(e.message); }
+    finally { setBusy(false); }
+  }, []);
+
+  const unpinRule = useCallback(async (pin_id) => {
+    if (!confirm(`Unpin ${pin_id}? Existing fires remain recorded.`)) return;
+    try {
+      const r = await fetch(`/api/v2/live/pin/${encodeURIComponent(pin_id)}`, {method: 'DELETE'});
+      if (!r.ok) { const d = await r.json(); throw new Error(d.error); }
+      // Refresh
+      const rr = await fetch('/api/v2/live/pinned'); const dd = await rr.json();
+      setPinned(dd.rules || []);
+      if (selectedPin === pin_id) setSelectedPin(null);
+    } catch (e) { alert(e.message); }
+  }, [selectedPin]);
+
+  const downloadDiag = useCallback(async () => {
+    try {
+      const r = await fetch('/api/v2/live/diagnostic');
+      const b = await r.blob();
+      const fn = r.headers.get('content-disposition')?.match(/filename="(.+)"/)?.[1] || 'live_diag.json';
+      const u = URL.createObjectURL(b);
+      const a = document.createElement('a');
+      a.href = u; a.download = fn;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a); URL.revokeObjectURL(u);
+    } catch (e) { alert(e.message); }
+  }, []);
+
+  const precColor = (p) => {
+    if (p == null) return "#64748b";
+    if (p >= 0.70) return "#22c55e";
+    if (p >= 0.55) return "#eab308";
+    return "#ef4444";
+  };
+
+  const deltaColor = (d) => {
+    if (d == null) return "#64748b";
+    if (d >= -0.05) return "#22c55e";   // within 5pp of validation = holding up
+    if (d >= -0.15) return "#eab308";   // 5-15pp below = warning
+    return "#ef4444";                   // >15pp below = signal likely collapsed
+  };
+
+  const byRule = stats?.by_rule || {};
+  const totals = stats?.totals || {};
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+      {/* ── BANNER ── */}
+      <Box>
+        <div style={{fontSize:11,color:"#22c55e",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6,fontWeight:700}}>
+          v2 Stage 3 — Live Scanner & Outcome Recording
+        </div>
+        <div style={{fontSize:12,color:"#94a3b8",lineHeight:1.6}}>
+          Pinned rules are evaluated against fresh Coinbase data every 4 hours (at :06 after
+          each 4h slot). Every fire is recorded. After each rule's horizon elapses, the outcome
+          is resolved automatically (was +X% hit?). Compare live precision to validation
+          precision — if they match, the pattern is real.
+          Pin rules from the <span style={{color:"#8b5cf6"}}>Rules</span> tab.
+        </div>
+      </Box>
+
+      {/* ── CONTROLS ── */}
+      <Box>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <Btn onClick={runScanNow} disabled={busy||scanStatus?.inProgress} color="#22c55e"
+            style={{padding:"6px 12px",fontSize:11,fontWeight:700}}>
+            {scanStatus?.inProgress ? "Scanning..." : "▶ Run scan now"}
+          </Btn>
+          <Btn onClick={resolveOutcomesNow} disabled={busy} color="#f97316"
+            style={{padding:"6px 12px",fontSize:11}}>
+            ↻ Resolve outcomes now
+          </Btn>
+          {pinned.length > 0 && (
+            <Btn onClick={downloadDiag} color="#f97316"
+              style={{padding:"6px 12px",fontSize:11}}>
+              ⬇ Download live diagnostic
+            </Btn>
+          )}
+          <div style={{flex:1}}/>
+          {scanStatus?.lastResult && !scanStatus.inProgress && (
+            <div style={{fontSize:11,color:"#64748b"}}>
+              Last scan: {scanStatus.lastResult.status === "ok"
+                ? `${scanStatus.lastResult.n_fires} fires across ${scanStatus.lastResult.n_coins_evaluated} coins in ${scanStatus.lastResult.elapsed_sec}s`
+                : `status: ${scanStatus.lastResult.status}`}
+            </div>
+          )}
+        </div>
+        {scanStatus?.inProgress && (
+          <div style={{marginTop:8,fontSize:11,color:"#22c55e"}}>
+            ⚡ Scan in progress — this polls every 3s until complete.
+          </div>
+        )}
+        {error && (
+          <div style={{marginTop:8,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.1)",
+            border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:11}}>
+            {error}
+          </div>
+        )}
+      </Box>
+
+      {/* ── PINNED RULES STATS ── */}
+      <Box>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+          <Lbl>Pinned Rules ({pinned.length})</Lbl>
+          {totals.n_fires_resolved > 0 && (
+            <div style={{fontSize:11,color:"#94a3b8"}}>
+              Total: {totals.n_fires_resolved} resolved / {totals.n_fires_pending} pending /{" "}
+              <span style={{color:precColor(totals.overall_live_precision),fontWeight:600}}>
+                {totals.overall_live_precision != null ? `${(totals.overall_live_precision*100).toFixed(1)}%` : "—"}
+              </span> overall
+            </div>
+          )}
+        </div>
+
+        {pinned.length === 0 ? (
+          <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
+            No pinned rules. Go to the <span style={{color:"#8b5cf6",fontWeight:600}}>Rules tab</span>,
+            click a rule, and use the "Pin to Live" button in its detail view.
+          </div>
+        ) : (
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead>
+                <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+                  <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Rule</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Threshold/H</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Val P</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Live P</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Δ</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Hits/Res</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Pending</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Avg Max%</th>
+                  <th style={{padding:"6px 8px",textAlign:"center",color:"#64748b",fontSize:10,fontWeight:500}}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {pinned.map(p => {
+                  const s = byRule[p.pin_id] || {};
+                  const isSel = selectedPin === p.pin_id;
+                  return (
+                    <tr key={p.pin_id}
+                      onClick={() => setSelectedPin(isSel ? null : p.pin_id)}
+                      style={{borderBottom:"1px solid rgba(255,255,255,0.03)",cursor:"pointer",
+                        background:isSel?"rgba(34,197,94,0.08)":"transparent"}}>
+                      <td style={{padding:"6px 8px",maxWidth:380}}>
+                        <div style={{fontSize:11,color:"#e2e8f0",fontFamily:F,
+                          whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                          {p.english}
+                          {p.disqualifier && (
+                            <span style={{color:"#f97316",marginLeft:6,fontSize:10}}>
+                              (+ DQ: {p.disqualifier.condition})
+                            </span>
+                          )}
+                        </div>
+                        <div style={{fontSize:9,color:"#475569",fontFamily:F}}>
+                          pin_id: {p.pin_id.slice(0, 28)}{p.pin_id.length > 28 ? "..." : ""}
+                        </div>
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                        +{(p.threshold_pct*100).toFixed(1)}% / {p.horizon_hours}h
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(p.validation_precision),fontWeight:600}}>
+                        {p.validation_precision != null ? `${(p.validation_precision*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(s.live_precision),fontWeight:700}}>
+                        {s.live_precision != null ? `${(s.live_precision*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:deltaColor(s.precision_delta)}}>
+                        {s.precision_delta != null ? `${(s.precision_delta*100).toFixed(1)}pp` : "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                        {s.n_hits ?? 0}/{s.n_fires_resolved ?? 0}
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#64748b"}}>
+                        {s.n_fires_pending ?? 0}
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                        {s.avg_max_pct != null ? `${(s.avg_max_pct*100).toFixed(2)}%` : "—"}
+                      </td>
+                      <td style={{padding:"6px 8px",textAlign:"center"}}>
+                        <span onClick={(e) => { e.stopPropagation(); unpinRule(p.pin_id); }}
+                          style={{cursor:"pointer",color:"#64748b",fontSize:16,fontWeight:700}}
+                          title="Unpin rule">×</span>
+                      </td>
+                    </tr>);
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {pinned.length > 0 && (
+          <div style={{fontSize:10,color:"#475569",marginTop:10,lineHeight:1.6}}>
+            <span style={{color:"#22c55e"}}>Green Δ</span>: live precision within 5pp of validation (healthy).{" "}
+            <span style={{color:"#eab308"}}>Yellow Δ</span>: 5-15pp below (warning).{" "}
+            <span style={{color:"#ef4444"}}>Red Δ</span>: &gt;15pp below (signal likely collapsed).{" "}
+            Click a row to filter fires by that rule.
+          </div>
+        )}
+      </Box>
+
+      {/* ── RECENT FIRES ── */}
+      {pinned.length > 0 && (
+        <Box>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+            <Lbl>Recent Fires {selectedPin ? `(filtered to ${selectedPin.slice(0,20)}...)` : "(all rules)"}</Lbl>
+            {selectedPin && (
+              <Btn onClick={() => setSelectedPin(null)} style={{padding:"3px 8px",fontSize:10}}>
+                Clear filter
+              </Btn>
+            )}
+          </div>
+          {fires.length === 0 ? (
+            <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
+              No fires yet{selectedPin?" for this rule":""}. Fires appear here after the next
+              scheduled scan (every 4h at :06) or when you click "Run scan now".
+            </div>
+          ) : (
+            <div style={{overflowX:"auto",maxHeight:400,overflowY:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                <thead style={{position:"sticky",top:0,background:"#0c0f14"}}>
+                  <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+                    <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Scan Time</th>
+                    <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Product</th>
+                    <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Entry</th>
+                    <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Rule</th>
+                    <th style={{padding:"6px 8px",textAlign:"center",color:"#64748b",fontSize:10,fontWeight:500}}>Status</th>
+                    <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Max %</th>
+                    <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Final %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fires.slice().reverse().map(f => {
+                    const oc = f.outcome || {};
+                    const statusColor = !f.resolved ? "#64748b"
+                      : oc.error ? "#ef4444"
+                      : oc.hit ? "#22c55e" : "#ef4444";
+                    const statusText = !f.resolved ? "Pending"
+                      : oc.error ? `Err`
+                      : oc.hit ? "✓ Hit" : "✗ Miss";
+                    return (
+                      <tr key={f.fire_id} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                        <td style={{padding:"4px 6px",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                          {f.scan_time ? new Date(f.scan_time).toLocaleString() : "—"}
+                        </td>
+                        <td style={{padding:"4px 6px",fontSize:10,color:"#e2e8f0",fontWeight:600}}>
+                          {f.product}
+                        </td>
+                        <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                          {f.entry_price != null ? `$${f.entry_price.toLocaleString(undefined,{maximumFractionDigits:4})}` : "—"}
+                        </td>
+                        <td style={{padding:"4px 6px",fontSize:9,color:"#64748b",fontFamily:F}}>
+                          {f.pin_id?.slice(0, 18)}{f.pin_id?.length > 18 ? "…" : ""}
+                          {f.disqualifier_applied && <span style={{color:"#f97316",marginLeft:4}}>[+DQ]</span>}
+                        </td>
+                        <td style={{padding:"4px 6px",textAlign:"center",fontSize:10,fontWeight:700,color:statusColor}}>
+                          {statusText}
+                        </td>
+                        <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                          {oc.max_pct != null ? `${(oc.max_pct*100).toFixed(2)}%` : "—"}
+                        </td>
+                        <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                          {oc.final_pct != null ? `${(oc.final_pct*100).toFixed(2)}%` : "—"}
+                        </td>
+                      </tr>);
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div style={{fontSize:10,color:"#475569",marginTop:8,lineHeight:1.5}}>
+            Showing last {fires.length} fires. Max % = highest price reached during horizon.
+            Final % = close at end of horizon. Hit means max % ≥ threshold within horizon.
+          </div>
+        </Box>
+      )}
+    </div>
+  );
+}
+
 // ─── MAIN ────────────────────────────────────────────────────────
 export default function CoinbaseScanner() {
   const [scanHour,setScanHour]=useState(12);
-  const [tab,setTab]=useState("rules");
+  const [tab,setTab]=useState("live");
   const [data,setData]=useState([]);
   const [source,setSource]=useState("loading");
   const [loading,setLoading]=useState(true);
@@ -1544,7 +1933,7 @@ export default function CoinbaseScanner() {
     }catch(e){alert(e.message);}
   },[]);
 
-  const tabs=[{id:"rules",l:"Rules (v2.2)",c:"#8b5cf6"},{id:"v2",l:"v2 Classifier"},{id:"scanner",l:"Scanner (v1)"},{id:"training",l:"Training (v1)",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes (v1)",c:"#22c55e"},{id:"status",l:"Status"}];
+  const tabs=[{id:"live",l:"Live (v2.3)",c:"#22c55e"},{id:"rules",l:"Rules (v2.2)",c:"#8b5cf6"},{id:"v2",l:"v2 Classifier"},{id:"scanner",l:"Scanner (v1)"},{id:"training",l:"Training (v1)",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes (v1)",c:"#22c55e"},{id:"status",l:"Status"}];
 
   return (
     <div style={{fontFamily:F,background:"#0c0f14",color:"#e2e8f0",minHeight:"100vh"}}>
@@ -1555,11 +1944,12 @@ export default function CoinbaseScanner() {
         </div>
         <div style={{display:"flex",gap:4,fontSize:11,flexWrap:"wrap",alignItems:"center"}}>
           <span style={{color:"#eab308",fontWeight:600}}>
-            {tab==="rules" ? "v2 Stage 2 — Rule mining (absolute +%, multi-horizon)" :
+            {tab==="live" ? "v2 Stage 3 — Live scanner + outcome recording" :
+              tab==="rules" ? "v2 Stage 2 — Rule mining (absolute +%, multi-horizon)" :
               tab==="v2" ? "v2 — Vol-normalized threshold classifier (Stage 1)" :
               health ? `TP +${health.tp_pct}% / SL -${health.sl_pct}% / ${health.horizonHours||4}h horizon (BE ${health.breakeven}%)` : "Loading..."}
           </span>
-          {lastUpdate&&tab!=="v2"&&tab!=="rules"&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
+          {lastUpdate&&tab!=="v2"&&tab!=="rules"&&tab!=="live"&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
         </div>
       </div>
 
@@ -1578,6 +1968,7 @@ export default function CoinbaseScanner() {
       {error&&<div style={{margin:"12px 20px 0",padding:"8px 12px",borderRadius:6,background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:12}}>{error}</div>}
 
       <div style={{padding:"16px 20px"}}>
+        {tab==="live"&&<LiveTab/>}
         {tab==="rules"&&<RulesTab/>}
         {tab==="v2"&&<V2Tab/>}
         {tab==="scanner"&&<ScannerTab data={data} scanHour={scanHour} source={source} elapsed={elapsed} message={message} modelWR10={modelWR10} modelPnL10={modelPnL10} health={health} scanInfo={scanInfo}/>}

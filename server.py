@@ -1953,6 +1953,297 @@ def v2_debug_disqualifier(threshold_bps: int, horizon_hours: int, rule_index: in
         import traceback
         return JSONResponse({"error": str(e), "traceback": traceback.format_exc()}, 500)
 
+# ═══════════════════════════════════════════════════════════════════
+# v2 STAGE 3 — Live scanner and outcome recording
+# ═══════════════════════════════════════════════════════════════════
+# The Stage 3 flow:
+#   1. User pins rules from validated catalogs (with optional disqualifier)
+#   2. A scheduled job runs every 4 hours: compute v2 features for all coins,
+#      evaluate pinned rules, persist fires to disk
+#   3. Another scheduled job runs hourly: for each unresolved fire whose horizon
+#      has elapsed, fetch post-bars and determine hit/miss
+#   4. Dashboard: live precision per rule vs validation precision
+#
+# Live scan uses FRESH Coinbase data (not cached), because the point is to
+# validate forward outcomes. It takes ~20-30 sec since it only fetches enough
+# history to compute features (~48 bars = 12h × 15min) per coin.
+
+import v2_live as v2_live_module
+
+V2_LIVE_DIR = DATA_DIR / "live_v2"
+V2_LIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Lock to prevent concurrent live scans (they'd duplicate fires)
+v2_live_scan_in_progress = False
+v2_live_scan_last_result = None
+
+def _v2_compute_live_features(intraday_by_product, daily_by_product,
+                                scan_time):
+    """
+    For each coin in PRODUCTS, compute the 53 v2 features using the most
+    recent bars. Returns {product: {feature: value}} and {product: entry_price}.
+
+    Matches how v2 features were computed during mining, except:
+      - scan_hour is derived from scan_time.hour
+      - "now" is the scan time; all bars with timestamp < scan_time are history
+      - The entry_price for outcome tracking is the most recent bar's close
+        (the price the user would realistically enter at)
+    """
+    btc_bars = sorted(intraday_by_product.get(BENCHMARK, []), key=lambda b: b["t"])
+    if len(btc_bars) < 50:
+        log.error(f"live scan: insufficient BTC bars ({len(btc_bars)})")
+        return {}, {}
+    # Keep only bars BEFORE scan_time (strict).
+    scan_ts = scan_time.isoformat().replace("+00:00", "Z")
+    btc_bars = [b for b in btc_bars if b["t"] < scan_ts]
+    if len(btc_bars) < 50:
+        log.error(f"live scan: insufficient BTC bars after filter ({len(btc_bars)})")
+        return {}, {}
+
+    btc_atr = v2_module.compute_atr_fraction(btc_bars)
+    btc_ctx = v2_module.compute_btc_context_v2(btc_bars[-48:], btc_atr)
+
+    scan_hour = scan_time.hour
+
+    # Collect features per coin, preparing for cross-sectional ranks
+    date_feats, date_meta, date_cats, date_dv = [], [], [], []
+    entry_prices = {}
+
+    for product in PRODUCTS:
+        bars = sorted(intraday_by_product.get(product, []), key=lambda b: b["t"])
+        bars_before = [b for b in bars if b["t"] < scan_ts]
+        if len(bars_before) < v2_module.MIN_BARS_FOR_FEATURES:
+            continue
+        feat_bars = bars_before[-v2_module.FEATURE_LOOKBACK_BARS:]
+        atr_frac = v2_module.compute_atr_fraction(bars_before)
+        current_price = feat_bars[-1]["c"]
+        # Open of the scan day's first bar
+        scan_date = scan_time.date().isoformat()
+        today_bars = [b for b in bars_before if b["t"][:10] == scan_date]
+        open_price = today_bars[0]["o"] if today_bars else current_price
+
+        feat = v2_module.compute_features_v2(
+            feat_bars, daily_by_product.get(product, []),
+            current_price, open_price, scan_hour,
+            btc_bars_before=btc_bars[-50:], btc_context=btc_ctx,
+            atr_frac=atr_frac,
+        )
+        if feat is None: continue
+        date_feats.append(feat)
+        date_meta.append({"product": product})
+        date_cats.append(CATEGORIES.get(product, "?"))
+        date_dv.append(sum(b["v"] * b["c"] for b in feat_bars[-20:]))
+        entry_prices[product] = float(current_price)
+
+    if len(date_feats) < 3:
+        log.warning(f"live scan: only {len(date_feats)} coins with usable features")
+        return {}, {}
+
+    v2_module.add_cross_sectional_features_v2(date_feats, date_cats, date_dv)
+
+    features_by_coin = {}
+    for i, meta in enumerate(date_meta):
+        features_by_coin[meta["product"]] = date_feats[i]
+    return features_by_coin, entry_prices
+
+
+def _v2_get_post_bars(product, start_dt, n_bars):
+    """
+    For outcome recording: fetch intraday bars for `product` starting at
+    start_dt, as many as needed to cover n_bars (15-min bars).
+    Called by v2_live.record_outcomes after a fire's horizon has elapsed.
+
+    Strategy: use cached intraday bars if fresh enough; otherwise fetch just
+    for this one product over the needed time window.
+    """
+    try:
+        # Try cache first — it might already have what we need
+        intra_age = cache_age_hours(BARS_INTRADAY_CACHE)
+        if intra_age < CACHE_MAX_AGE_HOURS:
+            cached = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+            bars = cached.get(product, [])
+            start_ts = start_dt.isoformat().replace("+00:00", "Z")
+            bars_after = sorted([b for b in bars if b["t"] > start_ts],
+                                 key=lambda b: b["t"])
+            if len(bars_after) >= n_bars:
+                return bars_after[:n_bars]
+        # Fall through to fresh fetch
+        client = cb_client()
+        # Fetch window: start_dt to start_dt + n_bars * 15min + 1h buffer
+        end_dt = start_dt + timedelta(minutes=n_bars * 15 + 60)
+        bars = fetch_candles_for_product(client, product, start_dt, end_dt,
+                                          CANDLE_GRANULARITY)
+        client.close()
+        start_ts = start_dt.isoformat().replace("+00:00", "Z")
+        bars_after = sorted([b for b in bars if b["t"] > start_ts],
+                             key=lambda b: b["t"])
+        return bars_after[:n_bars]
+    except Exception as e:
+        log.warning(f"_v2_get_post_bars({product}): {e}")
+        return []
+
+
+def _v2_run_live_scan():
+    """Top-level live-scan function called by scheduler or manual trigger."""
+    global v2_live_scan_in_progress, v2_live_scan_last_result
+    if v2_live_scan_in_progress:
+        log.info("live scan skipped: already in progress")
+        return {"status": "skipped", "reason": "already_in_progress"}
+
+    pinned = v2_live_module.load_pinned_rules(V2_LIVE_DIR)
+    if not pinned:
+        log.info("live scan skipped: no pinned rules")
+        return {"status": "skipped", "reason": "no_pinned_rules"}
+
+    v2_live_scan_in_progress = True
+    t0 = time.time()
+    try:
+        log.info(f"v2 live scan: starting with {len(pinned)} pinned rules")
+        scan_time = now_utc().replace(second=0, microsecond=0)
+
+        client = cb_client()
+        # Fetch intraday bars — need FEATURE_LOOKBACK_BARS = 48 plus enough
+        # BTC context history (~50 more). Fetch last 3 days to be safe.
+        end_dt = scan_time
+        start_dt = end_dt - timedelta(days=3)
+        fetch_products = list(set(PRODUCTS + [BENCHMARK]))
+        intraday = fetch_candles_bulk(client, fetch_products, start_dt, end_dt,
+                                        CANDLE_GRANULARITY)
+        # Daily bars for the daily_bars arg — 20 days
+        daily_start = end_dt - timedelta(days=20)
+        daily = fetch_candles_bulk(client, fetch_products, daily_start, end_dt,
+                                     86400)
+        client.close()
+
+        features_by_coin, entry_prices = _v2_compute_live_features(
+            intraday, daily, scan_time)
+        if not features_by_coin:
+            v2_live_scan_last_result = {
+                "status": "no_features",
+                "scan_time": scan_time.isoformat(),
+                "elapsed_sec": round(time.time() - t0, 1),
+            }
+            return v2_live_scan_last_result
+
+        fires = v2_live_module.scan_live(
+            V2_LIVE_DIR, features_by_coin, scan_time=scan_time,
+            entry_prices=entry_prices)
+
+        elapsed = round(time.time() - t0, 1)
+        result = {
+            "status": "ok",
+            "scan_time": scan_time.isoformat(),
+            "n_coins_evaluated": len(features_by_coin),
+            "n_pinned_rules": len(pinned),
+            "n_fires": len(fires),
+            "fires_by_pin": {pin["pin_id"]: sum(1 for f in fires if f["pin_id"] == pin["pin_id"])
+                              for pin in pinned},
+            "elapsed_sec": elapsed,
+        }
+        v2_live_scan_last_result = result
+        log.info(f"v2 live scan done: {len(fires)} fires in {elapsed}s")
+        return result
+    except Exception as e:
+        log.exception(f"v2 live scan failed: {e}")
+        v2_live_scan_last_result = {"status": "error", "error": str(e)}
+        return v2_live_scan_last_result
+    finally:
+        v2_live_scan_in_progress = False
+
+
+def _v2_run_record_outcomes():
+    """Top-level outcome recorder called by scheduler or manual trigger."""
+    try:
+        result = v2_live_module.record_outcomes(
+            V2_LIVE_DIR, _v2_get_post_bars, bars_per_hour=v2_module.BARS_PER_HOUR)
+        log.info(f"v2 record_outcomes: {result}")
+        return result
+    except Exception as e:
+        log.exception(f"v2 record_outcomes failed: {e}")
+        return {"error": str(e)}
+
+
+# ═══ Endpoints ═══
+
+class V2PinRuleRequest(BaseModel):
+    threshold_bps: int
+    horizon_hours: int
+    rule_id: str
+    disqualifier: dict = None   # optional: {feature, condition, thresh, direction}
+
+@app.post("/api/v2/live/pin")
+def v2_live_pin(req: V2PinRuleRequest):
+    """Pin a rule from a catalog to the live scanner."""
+    path = V2_RULES_DIR / f"rules_t{req.threshold_bps}_h{req.horizon_hours}.json"
+    if not path.exists():
+        return JSONResponse({"error": f"no catalog at {path.name}"}, 404)
+    try:
+        cat = json.loads(path.read_text())
+        pinned = v2_live_module.pin_rule(V2_LIVE_DIR, cat, req.rule_id,
+                                           disqualifier=req.disqualifier)
+        return {"status": "pinned", "pin": pinned}
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, 404)
+    except Exception as e:
+        log.exception(f"pin failed: {e}")
+        return JSONResponse({"error": str(e)}, 500)
+
+@app.delete("/api/v2/live/pin/{pin_id}")
+def v2_live_unpin(pin_id: str):
+    ok = v2_live_module.unpin_rule(V2_LIVE_DIR, pin_id)
+    return {"status": "unpinned" if ok else "not_found", "pin_id": pin_id}
+
+@app.get("/api/v2/live/pinned")
+def v2_live_list_pinned():
+    return {"rules": v2_live_module.load_pinned_rules(V2_LIVE_DIR)}
+
+@app.post("/api/v2/live/scan")
+def v2_live_scan_now(bg: BackgroundTasks):
+    """Trigger a live scan manually. Runs in the background."""
+    if v2_live_scan_in_progress:
+        return JSONResponse({"status": "already_in_progress"}, 409)
+    bg.add_task(_v2_run_live_scan)
+    return {"status": "started"}
+
+@app.get("/api/v2/live/scan/status")
+def v2_live_scan_status():
+    return {
+        "inProgress": v2_live_scan_in_progress,
+        "lastResult": v2_live_scan_last_result,
+    }
+
+@app.post("/api/v2/live/record_outcomes")
+def v2_live_record_outcomes_now(bg: BackgroundTasks):
+    """Trigger outcome resolution manually (usually automatic)."""
+    bg.add_task(_v2_run_record_outcomes)
+    return {"status": "started"}
+
+@app.get("/api/v2/live/stats")
+def v2_live_stats(window_days: int = None):
+    """Aggregated live stats per rule."""
+    return v2_live_module.aggregate_stats(V2_LIVE_DIR, window_days=window_days)
+
+@app.get("/api/v2/live/fires")
+def v2_live_fires(limit: int = 100, pin_id: str = None, only_unresolved: bool = False):
+    return {"fires": v2_live_module.list_recent_fires(
+        V2_LIVE_DIR, limit=limit, pin_id=pin_id, only_unresolved=only_unresolved)}
+
+@app.get("/api/v2/live/diagnostic")
+def v2_live_diagnostic():
+    """Everything at once, for download."""
+    pinned = v2_live_module.load_pinned_rules(V2_LIVE_DIR)
+    stats = v2_live_module.aggregate_stats(V2_LIVE_DIR)
+    fires = v2_live_module.list_recent_fires(V2_LIVE_DIR, limit=1000)
+    return JSONResponse({
+        "_type": "coinbase_scanner_v2_live_diagnostic",
+        "_version": "v2.0_stage3",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "pinned_rules": pinned,
+        "stats": stats,
+        "recent_fires": fires,
+    }, headers={"Content-Disposition":
+        f'attachment; filename="coinbase_v2_live_diagnostic_{today_utc()}.json"'})
+
 # SPA fallback
 dist_path = Path(__file__).parent / "dist"
 if dist_path.exists():
@@ -1976,5 +2267,22 @@ def cron_scan():
 scheduler.add_job(cron_scan, "cron", hour=",".join(str(h) for h in SCAN_HOURS), minute=5)
 # Record outcomes at 00:30 UTC daily — 30min after the 20:00 scan's 4h horizon ends
 scheduler.add_job(record_outcomes, "cron", hour=0, minute=30)
+
+# v2 Stage 3 schedule:
+# Live scan at the same 6 slots as v1 (4h cadence), at :06 (1 min after v1's :05)
+# to avoid clobbering the single-threaded bar fetch.
+def v2_cron_live_scan():
+    try: _v2_run_live_scan()
+    except Exception as e: log.error(f"v2 cron live scan: {e}")
+scheduler.add_job(v2_cron_live_scan, "cron",
+                   hour=",".join(str(h) for h in SCAN_HOURS), minute=6)
+# Outcome resolution runs hourly — cheap (just reads JSONL, pulls bars for
+# fires whose horizons have elapsed)
+def v2_cron_record_outcomes():
+    try: _v2_run_record_outcomes()
+    except Exception as e: log.error(f"v2 cron record outcomes: {e}")
+scheduler.add_job(v2_cron_record_outcomes, "cron", minute=15)   # every hour at :15
+
 scheduler.start()
-log.info(f"Scheduler: scans {SCAN_HOURS} UTC :05, outcomes 00:30 UTC")
+log.info(f"Scheduler: v1 scans {SCAN_HOURS} UTC :05, v1 outcomes 00:30 UTC, "
+         f"v2 live scans :06, v2 outcomes hourly at :15")
