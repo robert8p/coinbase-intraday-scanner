@@ -699,9 +699,11 @@ def disqualifier_analysis(rule, binned_df, raw_df, labels, train_mask, feature_n
         fp_vals = fires_df[feat].iloc[fp_mask].dropna()
         if len(tp_vals) < 5 or len(fp_vals) < 5:
             continue
-        # Try several candidate thresholds: the 25/50/75th percentile of combined dist
+        # Try several candidate thresholds across the combined distribution.
+        # Use more points (7) than before (3) so we don't miss sharp cutoffs
+        # in the tails where disqualifiers often live.
         all_vals = np.concatenate([tp_vals.values, fp_vals.values])
-        candidate_thresholds = np.quantile(all_vals, [0.25, 0.5, 0.75])
+        candidate_thresholds = np.quantile(all_vals, [0.10, 0.25, 0.40, 0.50, 0.60, 0.75, 0.90])
 
         for thresh in candidate_thresholds:
             for direction in (">", "<"):
@@ -716,11 +718,21 @@ def disqualifier_analysis(rule, binned_df, raw_df, labels, train_mask, feature_n
                 remaining_fp = n_fp - excluded_fp
                 if remaining_tp + remaining_fp < 10:
                     continue
+                if remaining_tp < 5:
+                    continue   # don't annihilate the winners; keep some coverage
                 new_precision = remaining_tp / (remaining_tp + remaining_fp)
                 old_precision = n_tp / (n_tp + n_fp)
                 precision_gain = new_precision - old_precision
-                # Only meaningful if we remove more FPs than TPs
-                if excluded_fp > excluded_tp and precision_gain > 0.03:
+                # Compare EXCLUSION RATES, not raw counts. When TP:FP ratio is
+                # skewed (e.g., 1100 TPs vs 587 FPs in a 65%-precision rule),
+                # any cut through the middle of a feature excludes TPs and FPs
+                # at their natural 1.9:1 ratio — so `excluded_fp > excluded_tp`
+                # would almost never fire. The right test: does this threshold
+                # remove FPs disproportionately, i.e. fp_exclusion_rate >
+                # tp_exclusion_rate? That's what actually moves precision up.
+                fp_excl_rate = excluded_fp / n_fp
+                tp_excl_rate = excluded_tp / n_tp
+                if fp_excl_rate > tp_excl_rate and precision_gain >= 0.02:
                     candidates.append({
                         "feature": feat,
                         "condition": f"{feat} {'<=' if direction == '>' else '>='} {thresh:.4g}",
@@ -728,6 +740,10 @@ def disqualifier_analysis(rule, binned_df, raw_df, labels, train_mask, feature_n
                         "direction": "exclude_if_greater" if direction == ">" else "exclude_if_less",
                         "excluded_tp": excluded_tp,
                         "excluded_fp": excluded_fp,
+                        "fp_exclusion_rate": round(float(fp_excl_rate), 4),
+                        "tp_exclusion_rate": round(float(tp_excl_rate), 4),
+                        "remaining_tp": remaining_tp,
+                        "remaining_fp": remaining_fp,
                         "new_precision_train": round(float(new_precision), 4),
                         "precision_gain_train": round(float(precision_gain), 4),
                         "fp_excluded_per_tp_excluded": round(excluded_fp / max(1, excluded_tp), 2),
