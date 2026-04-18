@@ -1829,6 +1829,130 @@ def v2_rules_diagnostic():
     }, headers={"Content-Disposition":
         f'attachment; filename="coinbase_v2_rules_diagnostic_{today_utc()}.json"'})
 
+@app.get("/api/v2/rules/debug_disqualifier/{threshold_bps}/{horizon_hours}")
+def v2_debug_disqualifier(threshold_bps: int, horizon_hours: int, rule_index: int = 0):
+    """
+    Diagnostic endpoint: runs disqualifier_analysis step by step on one rule of
+    an existing catalog and returns every intermediate value so we can see
+    where it's returning empty. Also calls the real function at the end and
+    reports how many disqualifiers it found.
+
+    Usage: curl /api/v2/rules/debug_disqualifier/200/8
+           curl /api/v2/rules/debug_disqualifier/200/8?rule_index=0
+    """
+    path = V2_RULES_DIR / f"rules_t{threshold_bps}_h{horizon_hours}.json"
+    if not path.exists():
+        return JSONResponse({"error": f"no catalog at {path.name}"}, 404)
+
+    try:
+        cat = json.loads(path.read_text())
+        rules = cat.get("rules", [])
+        if rule_index >= len(rules):
+            return JSONResponse({"error": f"rule_index {rule_index} out of range ({len(rules)} rules)"}, 400)
+        rule = rules[rule_index]
+
+        # Reload cached bars
+        if not BARS_INTRADAY_CACHE.exists() or not BARS_DAILY_CACHE.exists():
+            return JSONResponse({"error": "no cached bars on disk"}, 500)
+        intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+        daily = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+
+        # Rebuild rows for this horizon only
+        threshold_pct = threshold_bps / 10000.0
+        rows, split_info = v2_module.build_rows_for_rule_mining(
+            intraday_bars=intraday, daily_bars=daily,
+            products=PRODUCTS, categories=CATEGORIES, benchmark=BENCHMARK,
+            scan_hours=SCAN_HOURS, horizon_hours_list=[horizon_hours],
+            pct_threshold=threshold_pct,
+        )
+
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        feature_names = list(v2_module.FEATURE_NAMES_V2)
+        binned_df, _, _ = v2_rules_module.build_binned_dataframe(
+            df, feature_names, df["is_train"].astype(bool).values)
+
+        label_col = f"label_{horizon_hours}h"
+        labels = df[label_col].astype(int).values
+        train_mask = df["is_train"].astype(bool).values
+
+        # Step through disqualifier logic
+        rule_mask = v2_rules_module.rule_to_mask(rule, binned_df)
+        combined_mask = rule_mask & train_mask
+        fires_labels = labels[combined_mask]
+        fires_df = df[combined_mask].reset_index(drop=True)
+        tp_mask = fires_labels == 1
+        fp_mask = fires_labels == 0
+        n_tp = int(tp_mask.sum())
+        n_fp = int(fp_mask.sum())
+
+        # Test one arbitrary continuous feature not in the rule
+        rule_feats = {c["feature"] for c in rule["conditions"]}
+        cont_features = [f for f in feature_names
+                          if f not in v2_rules_module.BINARY_FEATURES
+                          and f not in v2_rules_module.EXCLUDE_FROM_MINING
+                          and f not in rule_feats]
+
+        sample_results = []
+        for test_feat in cont_features[:5]:
+            if test_feat not in fires_df.columns:
+                sample_results.append({"feature": test_feat, "status": "NOT_IN_COLUMNS"})
+                continue
+            try:
+                tp_vals = fires_df[test_feat].iloc[tp_mask].dropna()
+                fp_vals = fires_df[test_feat].iloc[fp_mask].dropna()
+                sample_results.append({
+                    "feature": test_feat,
+                    "tp_count": len(tp_vals),
+                    "fp_count": len(fp_vals),
+                    "tp_mean": float(tp_vals.mean()) if len(tp_vals) else None,
+                    "fp_mean": float(fp_vals.mean()) if len(fp_vals) else None,
+                    "tp_first_3": tp_vals.head(3).tolist() if len(tp_vals) else [],
+                    "fp_first_3": fp_vals.head(3).tolist() if len(fp_vals) else [],
+                })
+            except Exception as e:
+                sample_results.append({"feature": test_feat, "error": str(e)})
+
+        # Actually call the real function
+        actual = v2_rules_module.disqualifier_analysis(
+            rule, binned_df, df, labels, train_mask, cont_features)
+
+        return JSONResponse({
+            "rule": {
+                "id": rule.get("id"),
+                "english": rule.get("english"),
+                "conditions": rule.get("conditions"),
+                "train_support_claimed": rule["train"]["support"],
+                "train_precision_claimed": rule["train"]["precision"],
+            },
+            "rebuilt_data": {
+                "n_rows_rebuilt": len(df),
+                "n_train": int(train_mask.sum()),
+                "label_mean": float(labels.mean()),
+                "n_feature_cols_binned": len(binned_df.columns),
+                "fires_df_dtypes_sample": {f: str(fires_df[f].dtype) for f in list(fires_df.columns)[:5]},
+            },
+            "rule_application": {
+                "rule_fires_total": int(rule_mask.sum()),
+                "rule_fires_on_train": int(combined_mask.sum()),
+                "tp_count": n_tp,
+                "fp_count": n_fp,
+                "early_exit_lt_20": int(combined_mask.sum()) < 20,
+                "early_exit_lt_5_each": n_tp < 5 or n_fp < 5,
+            },
+            "candidate_features": {
+                "total_continuous": len(cont_features),
+                "first_5_tested": sample_results,
+            },
+            "disqualifier_function_result": {
+                "count_returned": len(actual),
+                "first_3": actual[:3] if actual else [],
+            },
+        })
+    except Exception as e:
+        import traceback
+        return JSONResponse({"error": str(e), "traceback": traceback.format_exc()}, 500)
+
 # SPA fallback
 dist_path = Path(__file__).parent / "dist"
 if dist_path.exists():
