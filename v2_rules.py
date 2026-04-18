@@ -673,7 +673,12 @@ def disqualifier_analysis(rule, binned_df, raw_df, labels, train_mask, feature_n
         return []
 
     fires_labels = labels[mask]
-    fires_df = raw_df[mask]
+    # Critical: reset_index so positional bool masks line up. The original
+    # raw_df preserves its source indices; using .loc with a numpy bool mask
+    # would attempt INDEX alignment (not positional), yielding NaN for every
+    # feature and silently returning []. This bug swallowed all disqualifier
+    # results in the first real mining run.
+    fires_df = raw_df[mask].reset_index(drop=True)
     tp_mask = fires_labels == 1
     fp_mask = fires_labels == 0
 
@@ -688,8 +693,10 @@ def disqualifier_analysis(rule, binned_df, raw_df, labels, train_mask, feature_n
             continue
         if feat in [c["feature"] for c in rule["conditions"]]:
             continue   # don't propose the same feature as a disqualifier
-        tp_vals = fires_df.loc[tp_mask, feat].dropna()
-        fp_vals = fires_df.loc[fp_mask, feat].dropna()
+        # .iloc[positional_bool_array] correctly indexes positionally, which
+        # is what we want (not .loc which would try to index-align).
+        tp_vals = fires_df[feat].iloc[tp_mask].dropna()
+        fp_vals = fires_df[feat].iloc[fp_mask].dropna()
         if len(tp_vals) < 5 or len(fp_vals) < 5:
             continue
         # Try several candidate thresholds: the 25/50/75th percentile of combined dist
