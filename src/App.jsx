@@ -2108,9 +2108,23 @@ function BacktestPanel({ pinned }) {
       {/* Results */}
       {selectedReport && selectedReport.per_rule && (
         <div>
-          <div style={{fontSize:10,color:"#64748b",marginBottom:8}}>
-            Backtest <b>{selectedReport.backtest_id}</b> — range {selectedReport.date_range?.actual_first} to {selectedReport.date_range?.actual_last}
-            {" "}({selectedReport.date_range?.n_rows} rows, {selectedReport.date_range?.n_distinct_dates} dates)
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
+            <div style={{fontSize:10,color:"#64748b"}}>
+              Backtest <b>{selectedReport.backtest_id}</b> — range {selectedReport.date_range?.actual_first} to {selectedReport.date_range?.actual_last}
+              {" "}({selectedReport.date_range?.n_rows} rows, {selectedReport.date_range?.n_distinct_dates} dates)
+            </div>
+            <span style={{flex:1}}/>
+            <Btn onClick={() => {
+              const blob = new Blob([JSON.stringify(selectedReport, null, 2)], {type: "application/json"});
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a");
+              a.href = url;
+              a.download = `${selectedReport.backtest_id}.json`;
+              document.body.appendChild(a); a.click();
+              document.body.removeChild(a); URL.revokeObjectURL(url);
+            }} color="#a855f7" style={{padding:"3px 8px",fontSize:10}}>
+              ⬇ Download report
+            </Btn>
           </div>
           <div style={{overflowX:"auto",maxHeight:600,overflowY:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
