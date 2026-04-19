@@ -1226,6 +1226,67 @@ function RulesTab() {
                 </div>
               </div>
 
+              {/* Batch-pin controls */}
+              {sortedRules.length > 0 && (
+                <div style={{display:"flex",alignItems:"center",gap:8,padding:"10px 12px",marginBottom:10,
+                  background:"rgba(34,197,94,0.06)",border:"1px solid rgba(34,197,94,0.15)",borderRadius:4,flexWrap:"wrap"}}>
+                  <span style={{fontSize:11,color:"#94a3b8"}}>Batch pin to Live:</span>
+                  <Btn onClick={async () => {
+                    const n = sortedRules.length;
+                    const withDq = sortedRules.filter(r => (r.disqualifiers||[]).length > 0).length;
+                    if (!confirm(`Pin ALL ${n} rules (unrefined) + ${withDq} refined variants = up to ${n + withDq} pins.\n\nMax data collection mode (no dedup).\n\nContinue?`)) return;
+                    try {
+                      const res = await fetch('/api/v2/live/pin_batch', {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({
+                          threshold_bps: selectedCatalog.threshold_bps,
+                          horizon_hours: selectedCatalog.horizon_hours,
+                          top_n: 1000,
+                          include_disqualifier: true,
+                          dedup: false,
+                        }),
+                      });
+                      const d = await res.json();
+                      if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+                      alert(`Pinned ${d.n_pinned} rules (${d.n_rules_attempted} rules attempted, ${d.skipped.length} skipped without DQ, ${d.errors.length} errors).\n\nSwitch to Live tab to see them.`);
+                    } catch (e) { alert(`Batch pin failed: ${e.message}`); }
+                  }} color="#22c55e" style={{padding:"4px 10px",fontSize:10,fontWeight:700}}>
+                    📌 Pin ALL ({sortedRules.length} rules + their DQs)
+                  </Btn>
+                  <Btn onClick={async () => {
+                    if (!confirm(`Pin top 5 DEDUPED rules + their top disqualifier variant?\n\n(Near-duplicate rules are collapsed first. You'll typically get 3-10 pins instead of 50.)`)) return;
+                    try {
+                      const res = await fetch('/api/v2/live/pin_batch', {
+                        method: 'POST', headers: {'Content-Type':'application/json'},
+                        body: JSON.stringify({
+                          threshold_bps: selectedCatalog.threshold_bps,
+                          horizon_hours: selectedCatalog.horizon_hours,
+                          top_n: 5,
+                          include_disqualifier: true,
+                          dedup: true,
+                        }),
+                      });
+                      const d = await res.json();
+                      if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+                      alert(`Pinned ${d.n_pinned} rules (deduped).`);
+                    } catch (e) { alert(`Batch pin failed: ${e.message}`); }
+                  }} color="#3b82f6" style={{padding:"4px 10px",fontSize:10}}>
+                    📌 Pin top 5 deduped + DQs
+                  </Btn>
+                  <span style={{flex:1}}/>
+                  <Btn onClick={async () => {
+                    if (!confirm(`Unpin ALL pinned rules? (This keeps fire/outcome history, just clears the active list.)`)) return;
+                    try {
+                      const res = await fetch('/api/v2/live/unpin_all', {method: 'POST'});
+                      const d = await res.json();
+                      alert(`Unpinned ${d.count} rules. History preserved.`);
+                    } catch (e) { alert(e.message); }
+                  }} color="#ef4444" style={{padding:"4px 10px",fontSize:10}}>
+                    🗑 Unpin all
+                  </Btn>
+                </div>
+              )}
+
               {sortedRules.length === 0 ? (
                 <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
                   No rules in this catalog.{" "}

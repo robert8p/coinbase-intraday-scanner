@@ -2188,6 +2188,133 @@ def v2_live_pin(req: V2PinRuleRequest):
         log.exception(f"pin failed: {e}")
         return JSONResponse({"error": str(e)}, 500)
 
+class V2BatchPinRequest(BaseModel):
+    threshold_bps: int
+    horizon_hours: int
+    top_n: int = 1000                   # default: pin everything
+    include_disqualifier: bool = True   # also pin each with top-1 disqualifier
+    dedup: bool = False                 # default: NO dedup, pin all rules as-is
+    skip_overfit: bool = False          # skip rules with overfit_flag=True
+
+@app.post("/api/v2/live/pin_batch")
+def v2_live_pin_batch(req: V2BatchPinRequest):
+    """
+    Batch-pin rules from a catalog.
+
+    Default behavior (dedup=False): pins every rule in the catalog (up to
+    `top_n`, sorted by test precision desc), plus each rule's top disqualifier
+    variant when available. This is "max data collection" mode — every rule
+    gets its own live pin regardless of near-duplicate conditions. You'll see
+    many rules with identical stats in the dashboard but they're all
+    independently tracked.
+
+    Optional (dedup=True): collapses rules that share the same core continuous
+    conditions (near-duplicate apriori results). Keeps the simplest
+    representative per pattern group.
+
+    Returns: {pinned: [...], skipped: [...], errors: [...], n_pinned: int,
+              n_rules_attempted: int, dedup_applied: bool}
+    """
+    path = V2_RULES_DIR / f"rules_t{req.threshold_bps}_h{req.horizon_hours}.json"
+    if not path.exists():
+        return JSONResponse({"error": f"no catalog at {path.name}"}, 404)
+    try:
+        cat = json.loads(path.read_text())
+        rules = cat.get("rules", [])
+        if not rules:
+            return {"pinned": [], "skipped": [], "errors": ["catalog has no rules"]}
+
+        # Sort by test precision descending
+        rules = sorted(rules, key=lambda r: -(r.get("test", {}).get("precision") or 0))
+
+        # Optional dedup
+        if req.dedup:
+            BINARY = v2_rules_module.BINARY_FEATURES
+            def core_signature(rule):
+                conds = sorted(
+                    [(c["feature"], tuple(sorted(c["bins"])))
+                     for c in rule.get("conditions", [])
+                     if c["feature"] not in BINARY],
+                    key=lambda x: x[0],
+                )
+                return tuple(conds)
+            groups = {}
+            for r in rules:
+                sig = core_signature(r)
+                if sig not in groups or \
+                   len(r.get("conditions", [])) < len(groups[sig].get("conditions", [])):
+                    groups[sig] = r
+            deduped = []
+            seen = set()
+            for r in rules:
+                sig = core_signature(r)
+                if sig in seen: continue
+                seen.add(sig)
+                deduped.append(groups[sig])
+            rules = deduped
+
+        # Optionally skip overfit-flagged rules
+        if req.skip_overfit:
+            rules = [r for r in rules if not r.get("overfit_flag", False)]
+
+        # Truncate to top_n
+        to_pin = rules[:req.top_n]
+        log.info(f"batch pin: {len(cat.get('rules', []))} in catalog, "
+                 f"{len(to_pin)} selected to pin "
+                 f"(dedup={req.dedup}, skip_overfit={req.skip_overfit})")
+
+        pinned = []
+        skipped = []
+        errors = []
+        for rule in to_pin:
+            # Unrefined
+            try:
+                p = v2_live_module.pin_rule(V2_LIVE_DIR, cat, rule["id"])
+                pinned.append({"pin_id": p["pin_id"], "variant": "unrefined",
+                               "english": p["english"][:120],
+                               "test_precision": rule.get("test", {}).get("precision")})
+            except Exception as e:
+                errors.append(f"{rule['id']}: {e}")
+            # Refined (if requested and a disqualifier exists)
+            if req.include_disqualifier:
+                dq_list = rule.get("disqualifiers") or []
+                if dq_list:
+                    dq = dq_list[0]
+                    try:
+                        p2 = v2_live_module.pin_rule(
+                            V2_LIVE_DIR, cat, rule["id"],
+                            disqualifier={
+                                "feature": dq["feature"],
+                                "condition": dq["condition"],
+                                "thresh": dq["thresh"],
+                                "direction": dq["direction"],
+                            })
+                        pinned.append({"pin_id": p2["pin_id"], "variant": "refined",
+                                       "english": p2["english"][:120],
+                                       "disqualifier": dq["condition"],
+                                       "test_precision": rule.get("test", {}).get("precision")})
+                    except Exception as e:
+                        errors.append(f"{rule['id']}_refined: {e}")
+                else:
+                    skipped.append({"rule_id": rule["id"], "reason": "no_disqualifier_available"})
+        return {
+            "pinned": pinned, "skipped": skipped, "errors": errors,
+            "n_pinned": len(pinned), "n_rules_attempted": len(to_pin),
+            "dedup_applied": req.dedup,
+            "skip_overfit_applied": req.skip_overfit,
+        }
+    except Exception as e:
+        log.exception(f"batch pin failed: {e}")
+        return JSONResponse({"error": str(e)}, 500)
+
+@app.post("/api/v2/live/unpin_all")
+def v2_live_unpin_all():
+    """Unpin all rules. Keeps fires/outcomes history."""
+    pinned = v2_live_module.load_pinned_rules(V2_LIVE_DIR)
+    n = len(pinned)
+    v2_live_module.save_pinned_rules(V2_LIVE_DIR, [])
+    return {"status": "unpinned_all", "count": n}
+
 @app.delete("/api/v2/live/pin/{pin_id}")
 def v2_live_unpin(pin_id: str):
     ok = v2_live_module.unpin_rule(V2_LIVE_DIR, pin_id)
