@@ -2371,6 +2371,103 @@ def v2_live_diagnostic():
     }, headers={"Content-Disposition":
         f'attachment; filename="coinbase_v2_live_diagnostic_{today_utc()}.json"'})
 
+# ═══ Backtest endpoints ═══
+# The backtest reuses cached bars + v2.build_rows_for_rule_mining to produce
+# labeled rows for all horizons, then evaluates each pinned rule against the
+# rows. This is NOT a re-mine — no rules are discovered. It's a reproducibility
+# check + out-of-sample evaluation. Default range is the full cached window,
+# which INCLUDES training data, so precision will be inflated vs the catalog's
+# test-set precision. The report breaks results down by train/val/test slices
+# so the inflation is visible and the test-slice number serves as a
+# reproducibility sanity check.
+
+v2_backtest_in_progress = False
+v2_backtest_progress = {"pct": 0, "msg": "idle"}
+
+def _v2_run_backtest_bg(pin_ids=None, start_date=None, end_date=None,
+                         horizon_hours_list=None):
+    global v2_backtest_in_progress, v2_backtest_progress
+    if v2_backtest_in_progress:
+        return
+    v2_backtest_in_progress = True
+    v2_backtest_progress = {"pct": 0, "msg": "starting"}
+    try:
+        def cb(pct, msg):
+            global v2_backtest_progress
+            v2_backtest_progress = {"pct": pct, "msg": msg}
+
+        cb(1, "loading pinned rules")
+        pinned = v2_live_module.load_pinned_rules(V2_LIVE_DIR)
+        if pin_ids:
+            pinned = [p for p in pinned if p["pin_id"] in set(pin_ids)]
+        if not pinned:
+            v2_backtest_progress = {"pct": 100, "msg": "no_pinned_rules"}
+            return
+
+        # Determine horizons to build rows for
+        if horizon_hours_list is None:
+            horizon_hours_list = sorted(set(p["horizon_hours"] for p in pinned))
+
+        cb(2, "loading cached bars")
+        if not BARS_INTRADAY_CACHE.exists() or not BARS_DAILY_CACHE.exists():
+            v2_backtest_progress = {"pct": 100, "msg": "no_cached_bars"}
+            return
+        intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+        daily = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+
+        # Use the same threshold as the rules (they should all be same threshold
+        # since pins came from one or more catalogs. Take max threshold.)
+        threshold_pct = max(p["threshold_pct"] for p in pinned)
+
+        cb(3, f"building rows for horizons {horizon_hours_list}")
+        rows, split_info = v2_module.build_rows_for_rule_mining(
+            intraday_bars=intraday, daily_bars=daily,
+            products=PRODUCTS, categories=CATEGORIES, benchmark=BENCHMARK,
+            scan_hours=SCAN_HOURS, horizon_hours_list=horizon_hours_list,
+            pct_threshold=threshold_pct,
+            progress_cb=lambda pct, msg: cb(3 + int(pct * 0.07), f"building rows: {msg}"),
+        )
+        cb(10, f"built {len(rows)} rows, evaluating rules")
+
+        v2_live_module.run_backtest(
+            V2_LIVE_DIR, rows, horizon_hours_list, pinned,
+            progress_cb=cb, start_date=start_date, end_date=end_date,
+        )
+    except Exception as e:
+        log.exception(f"backtest failed: {e}")
+        v2_backtest_progress = {"pct": 100, "msg": f"error: {e}"}
+    finally:
+        v2_backtest_in_progress = False
+
+class V2BacktestRequest(BaseModel):
+    pin_ids: list = None     # None = all pinned
+    start_date: str = None   # YYYY-MM-DD, None = all rows
+    end_date: str = None
+
+@app.post("/api/v2/live/backtest")
+def v2_live_backtest(req: V2BacktestRequest, bg: BackgroundTasks):
+    """Trigger a backtest run. Runs in the background; poll /backtest/status."""
+    if v2_backtest_in_progress:
+        return JSONResponse({"status": "already_in_progress"}, 409)
+    bg.add_task(_v2_run_backtest_bg, req.pin_ids, req.start_date, req.end_date)
+    return {"status": "started"}
+
+@app.get("/api/v2/live/backtest/status")
+def v2_live_backtest_status():
+    return {"inProgress": v2_backtest_in_progress,
+            "progress": v2_backtest_progress}
+
+@app.get("/api/v2/live/backtest/list")
+def v2_live_backtest_list():
+    return {"backtests": v2_live_module.list_backtests(V2_LIVE_DIR)}
+
+@app.get("/api/v2/live/backtest/{backtest_id}")
+def v2_live_backtest_load(backtest_id: str):
+    r = v2_live_module.load_backtest(V2_LIVE_DIR, backtest_id)
+    if r is None:
+        return JSONResponse({"error": "not found"}, 404)
+    return r
+
 # SPA fallback
 dist_path = Path(__file__).parent / "dist"
 if dist_path.exists():

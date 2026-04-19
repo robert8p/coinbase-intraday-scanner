@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 
 const SCAN_HOURS = [0,4,8,12,16,20];
 const F = "'JetBrains Mono','SF Mono','Fira Code','Cascadia Code',monospace";
@@ -1947,7 +1947,263 @@ function LiveTab() {
           </div>
         </Box>
       )}
+
+      {/* ── BACKTEST ── */}
+      <BacktestPanel pinned={pinned} />
     </div>
+  );
+}
+
+// ─── BACKTEST PANEL ──────────────────────────────────────────────
+// Evaluates pinned rules against historical cached bars. Unlike live, this
+// uses rows that were ALREADY used for training/validation — so precision
+// numbers are inflated. We split results 3 ways (train/val/test) so you can
+// see train (inflated), val (slightly out-of-sample), test (true held-out).
+// The TEST-slice precision should reproduce the catalog's test precision
+// within ~1pp — that's the reproducibility check.
+
+function BacktestPanel({ pinned }) {
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [btStatus, setBtStatus] = useState({inProgress: false, progress: {pct:0, msg:"idle"}});
+  const [history, setHistory] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [selectedReport, setSelectedReport] = useState(null);
+  const [sortKey, setSortKey] = useState("overall_precision");
+  const [error, setError] = useState(null);
+
+  // Poll status whenever a backtest is running; also load the history list
+  useEffect(() => {
+    const loadStatus = () => {
+      fetch('/api/v2/live/backtest/status').then(r => r.json())
+        .then(setBtStatus).catch(() => {});
+      fetch('/api/v2/live/backtest/list').then(r => r.json())
+        .then(d => setHistory(d.backtests || [])).catch(() => {});
+    };
+    loadStatus();
+    const iv = setInterval(loadStatus, btStatus.inProgress ? 2000 : 15000);
+    return () => clearInterval(iv);
+  }, [btStatus.inProgress]);
+
+  // When a backtest completes and there's no selected report, auto-select newest
+  useEffect(() => {
+    if (!selected && history.length > 0 && !btStatus.inProgress) {
+      setSelected(history[0].backtest_id);
+    }
+  }, [history, btStatus.inProgress]);
+
+  // Load the selected backtest report
+  useEffect(() => {
+    if (!selected) { setSelectedReport(null); return; }
+    fetch(`/api/v2/live/backtest/${selected}`).then(r => r.json())
+      .then(setSelectedReport).catch(() => {});
+  }, [selected]);
+
+  const runBacktest = async () => {
+    setError(null);
+    const body = {};
+    if (startDate) body.start_date = startDate;
+    if (endDate) body.end_date = endDate;
+    try {
+      const r = await fetch('/api/v2/live/backtest', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (d.status === 'already_in_progress') setError("Backtest already in progress");
+    } catch (e) { setError(e.message); }
+  };
+
+  const precColor = (p) => {
+    if (p == null) return "#64748b";
+    if (p >= 0.70) return "#22c55e";
+    if (p >= 0.55) return "#eab308";
+    return "#ef4444";
+  };
+
+  const sortedRules = useMemo(() => {
+    if (!selectedReport?.per_rule) return [];
+    const rows = selectedReport.per_rule.slice();
+    const accessor = {
+      overall_precision: r => r.overall?.precision ?? -1,
+      overall_fires: r => r.overall?.n_fires ?? -1,
+      test_precision: r => r.by_split?.test?.precision ?? -1,
+      val_precision: r => r.by_split?.val?.precision ?? -1,
+      train_precision: r => r.by_split?.train?.precision ?? -1,
+      validation_precision: r => r.validation_precision ?? -1,
+    }[sortKey] || (r => -1);
+    rows.sort((a, b) => accessor(b) - accessor(a));
+    return rows;
+  }, [selectedReport, sortKey]);
+
+  return (
+    <Box>
+      <div style={{marginBottom:12}}>
+        <Lbl>🔁 Backtest Pinned Rules Against Historical Data</Lbl>
+        <div style={{fontSize:11,color:"#94a3b8",marginTop:6,lineHeight:1.6}}>
+          Evaluates all pinned rules against cached bars (full 180-day training window by default).
+          Results include <b>train</b> slice (inflated — rules were mined on this data),
+          <b>val</b> slice (slightly out-of-sample), and <b>test</b> slice (truly held out).
+          The <b>test</b> precision should roughly reproduce the catalog number.
+          Runs as a background job; expect ~30 sec for feature build + ~2 sec per rule.
+        </div>
+      </div>
+
+      {/* Controls */}
+      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:10,padding:"8px 10px",background:"rgba(168,85,247,0.06)",border:"1px solid rgba(168,85,247,0.15)",borderRadius:4}}>
+        <span style={{fontSize:11,color:"#94a3b8"}}>Date range:</span>
+        <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
+          style={{padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+            border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        <span style={{fontSize:10,color:"#64748b"}}>to</span>
+        <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
+          style={{padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+            border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        <span style={{fontSize:10,color:"#64748b"}}>
+          (leave blank = full cached window)
+        </span>
+        <span style={{flex:1}}/>
+        <Btn onClick={runBacktest} disabled={btStatus.inProgress || pinned.length === 0}
+          color="#a855f7" style={{padding:"5px 12px",fontSize:11,fontWeight:700}}>
+          {btStatus.inProgress ? `Running ${btStatus.progress?.pct ?? 0}%...` : "▶ Run Backtest"}
+        </Btn>
+      </div>
+
+      {btStatus.inProgress && (
+        <div style={{marginBottom:10}}>
+          <div style={{background:"rgba(168,85,247,0.15)",borderRadius:3,height:6,overflow:"hidden"}}>
+            <div style={{width:`${btStatus.progress?.pct ?? 0}%`,height:6,background:"#a855f7",transition:"width 0.3s"}}/>
+          </div>
+          <div style={{fontSize:10,color:"#a855f7",marginTop:4}}>
+            {btStatus.progress?.msg ?? "..."}
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <div style={{marginBottom:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.1)",
+          border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:11}}>
+          {error}
+        </div>
+      )}
+
+      {/* History selector */}
+      {history.length > 0 && (
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+          <span style={{fontSize:10,color:"#64748b"}}>Past runs:</span>
+          {history.slice(0, 5).map(h => (
+            <span key={h.backtest_id}
+              onClick={() => setSelected(h.backtest_id)}
+              style={{padding:"3px 8px",fontSize:10,cursor:"pointer",borderRadius:3,
+                background: selected === h.backtest_id ? "rgba(168,85,247,0.25)" : "rgba(255,255,255,0.05)",
+                border: selected === h.backtest_id ? "1px solid #a855f7" : "1px solid rgba(255,255,255,0.08)",
+                color: selected === h.backtest_id ? "#e9d5ff" : "#94a3b8"}}>
+              {new Date(h.generated_at).toLocaleString()} ({h.n_rules_evaluated} rules)
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Results */}
+      {selectedReport && selectedReport.per_rule && (
+        <div>
+          <div style={{fontSize:10,color:"#64748b",marginBottom:8}}>
+            Backtest <b>{selectedReport.backtest_id}</b> — range {selectedReport.date_range?.actual_first} to {selectedReport.date_range?.actual_last}
+            {" "}({selectedReport.date_range?.n_rows} rows, {selectedReport.date_range?.n_distinct_dates} dates)
+          </div>
+          <div style={{overflowX:"auto",maxHeight:600,overflowY:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead style={{position:"sticky",top:0,background:"#0c0f14"}}>
+                <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+                  <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Rule</th>
+                  <th onClick={() => setSortKey("overall_fires")} style={{padding:"6px 8px",textAlign:"right",color:sortKey==="overall_fires"?"#a855f7":"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                    Fires {sortKey==="overall_fires"?"↓":""}
+                  </th>
+                  <th onClick={() => setSortKey("overall_precision")} style={{padding:"6px 8px",textAlign:"right",color:sortKey==="overall_precision"?"#a855f7":"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                    Overall P {sortKey==="overall_precision"?"↓":""}
+                  </th>
+                  <th onClick={() => setSortKey("train_precision")} style={{padding:"6px 8px",textAlign:"right",color:sortKey==="train_precision"?"#a855f7":"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                    Train P {sortKey==="train_precision"?"↓":""}
+                  </th>
+                  <th onClick={() => setSortKey("val_precision")} style={{padding:"6px 8px",textAlign:"right",color:sortKey==="val_precision"?"#a855f7":"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                    Val P {sortKey==="val_precision"?"↓":""}
+                  </th>
+                  <th onClick={() => setSortKey("test_precision")} style={{padding:"6px 8px",textAlign:"right",color:sortKey==="test_precision"?"#a855f7":"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                    Test P {sortKey==="test_precision"?"↓":""}
+                  </th>
+                  <th onClick={() => setSortKey("validation_precision")} style={{padding:"6px 8px",textAlign:"right",color:sortKey==="validation_precision"?"#a855f7":"#64748b",fontSize:10,fontWeight:500,cursor:"pointer"}}>
+                    Catalog P {sortKey==="validation_precision"?"↓":""}
+                  </th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Coins</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sortedRules.map(r => {
+                  const ov = r.overall || {};
+                  const tr = r.by_split?.train || {};
+                  const va = r.by_split?.val || {};
+                  const te = r.by_split?.test || {};
+                  // Reproducibility check: is test precision close to catalog's validation?
+                  const reproDelta = (te.precision != null && r.validation_precision != null)
+                    ? te.precision - r.validation_precision : null;
+                  const hasDq = r.disqualifier != null;
+                  return (
+                    <tr key={r.pin_id} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                      <td style={{padding:"4px 6px",maxWidth:300}}>
+                        <div style={{fontSize:10,color:"#e2e8f0",fontFamily:F,
+                          whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                          {r.english}
+                          {hasDq && <span style={{color:"#f97316",marginLeft:4}}>[+DQ]</span>}
+                        </div>
+                        <div style={{fontSize:9,color:"#475569",fontFamily:F}}>
+                          {r.pin_id.slice(0, 30)}{r.pin_id.length > 30 ? "..." : ""}
+                        </div>
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                        {ov.n_hits ?? 0}/{ov.n_fires ?? 0}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,fontWeight:700,color:precColor(ov.precision),fontVariantNumeric:"tabular-nums"}}>
+                        {ov.precision != null ? `${(ov.precision*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:precColor(tr.precision),fontVariantNumeric:"tabular-nums"}}>
+                        {tr.precision != null ? `${(tr.precision*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:precColor(va.precision),fontVariantNumeric:"tabular-nums"}}>
+                        {va.precision != null ? `${(va.precision*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,fontWeight:700,color:precColor(te.precision),fontVariantNumeric:"tabular-nums"}}
+                        title={reproDelta != null ? `Δ vs catalog: ${(reproDelta*100).toFixed(1)}pp` : ""}>
+                        {te.precision != null ? `${(te.precision*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                        {r.validation_precision != null ? `${(r.validation_precision*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:10,color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>
+                        {ov.n_distinct_coins ?? 0}
+                      </td>
+                    </tr>);
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{fontSize:10,color:"#475569",marginTop:10,lineHeight:1.6}}>
+            <b style={{color:"#94a3b8"}}>Reading this table:</b>{" "}
+            <b>Train P</b> uses rows the rules were mined on — expect inflation.{" "}
+            <b>Test P</b> uses held-out rows — should match <b>Catalog P</b> within ~1pp (reproducibility check).{" "}
+            <b>Val P</b> is an intermediate out-of-sample measurement.{" "}
+            If Test P ≫ Catalog P, we have a reproducibility bug (fire detection differs from mining-time logic).{" "}
+            If Test P &lt; Catalog P materially, same concern.
+          </div>
+        </div>
+      )}
+
+      {!selectedReport && !btStatus.inProgress && history.length === 0 && (
+        <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
+          No backtests run yet. Click <b>Run Backtest</b> above to start one.
+        </div>
+      )}
+    </Box>
   );
 }
 

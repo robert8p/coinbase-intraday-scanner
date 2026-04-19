@@ -586,3 +586,274 @@ def list_recent_fires(live_dir: Path, limit: int = 100,
             return False
         return True
     return _jsonl_read(live_dir / "fires.jsonl", limit=limit, filter_fn=flt)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BACKTEST — evaluate pinned rules against historical rows
+# ═══════════════════════════════════════════════════════════════════
+
+def run_backtest(live_dir, rows, horizon_hours_list, pinned_rules,
+                  backtest_id=None, progress_cb=None, start_date=None,
+                  end_date=None):
+    """
+    For each pinned rule, evaluate it against every row in `rows` (inclusive of
+    start_date..end_date if provided). For each fire, use the row's label_{H}h
+    column to determine hit/miss (already computed during row build).
+
+    Returns the backtest report (also persists to disk under
+    {live_dir}/backtests/{backtest_id}.json).
+
+    Args:
+      rows: output of v2.build_rows_for_rule_mining — each row has features +
+            label_4h/6h/8h + is_train/is_val/is_test + date + product + scan_hour.
+      horizon_hours_list: horizons present in the rows (e.g. [4,6,8])
+      pinned_rules: list of pinned rule dicts (from load_pinned_rules)
+      start_date/end_date: ISO dates (YYYY-MM-DD) to filter rows by. If None,
+        use all rows. Inclusive.
+
+    Report structure:
+      {
+        "backtest_id": str,
+        "generated_at": ISO,
+        "date_range": {start, end, n_rows_in_range},
+        "n_rules": int,
+        "per_rule": [
+          {
+            "pin_id": str, "english": str, "conditions": [...],
+            "disqualifier": {...} or None,
+            "threshold_pct": float, "horizon_hours": int,
+            "validation_precision": float,   # from the pinned rule
+            "overall": {n_fires, n_hits, precision, hit_rate_by_coin, base_rate_in_range},
+            "by_split": {
+              "train": {n_fires, n_hits, precision},
+              "val":   {...},
+              "test":  {...},
+            },
+            "top_fire_coins": [(coin, hits, fires)...]  # top 20 coins by fire count
+          }, ...
+        ],
+      }
+    """
+    import pandas as pd
+    if backtest_id is None:
+        backtest_id = f"bt_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    def prog(p, m):
+        if progress_cb: progress_cb(p, m)
+        log.info(f"[backtest] {p}% — {m}")
+
+    # Filter rows by date range if specified
+    if start_date or end_date:
+        def in_range(r):
+            d = r.get("date", "")
+            if start_date and d < start_date: return False
+            if end_date and d > end_date: return False
+            return True
+        rows = [r for r in rows if in_range(r)]
+    n_rows = len(rows)
+    if n_rows == 0:
+        raise ValueError("No rows in date range")
+
+    prog(5, f"Building DataFrame from {n_rows} rows...")
+    df = pd.DataFrame(rows)
+
+    # For each pinned rule, we need to evaluate its conditions against each row.
+    # But the rule's conditions use BIN IDs (specific to the bin_edges stored
+    # with the pinned rule). We need to (a) use the pinned rule's own bin_edges,
+    # (b) assign each row's raw feature values to bins using those edges, (c)
+    # check if the row's bins match the rule's required bins.
+    prog(10, "Evaluating rules against rows...")
+
+    per_rule = []
+    n_pinned = len(pinned_rules)
+    for pi, pin in enumerate(pinned_rules):
+        bin_edges = pin.get("bin_edges", {})
+        horizon_hours = pin["horizon_hours"]
+        label_col = f"label_{horizon_hours}h"
+        if label_col not in df.columns:
+            log.warning(f"Pin {pin['pin_id']}: no label_{horizon_hours}h column, skipping")
+            continue
+
+        # Build a fire mask by evaluating rule conditions against each row.
+        # Vectorized where possible: for each condition's feature, assign bins
+        # to the whole column, then AND across conditions.
+        import numpy as np
+        fire_mask = np.ones(len(df), dtype=bool)
+        all_feats_present = True
+        for cond in pin["conditions"]:
+            feat = cond["feature"]
+            expected_bins = set(cond["bins"])
+            if feat not in df.columns:
+                all_feats_present = False
+                break
+            edges = bin_edges.get(feat)
+            edges_arr = np.array(edges) if edges is not None else None
+            # Assign bins for this column
+            col_vals = df[feat].values
+            if edges_arr is None:
+                # Binary — clamp to 0/1
+                col_bins = np.where(np.isfinite(col_vals),
+                                      np.clip(col_vals.astype(int), 0, 1), -1)
+            else:
+                # np.searchsorted gives us the insertion position — which equals
+                # the bin id (0..len(edges)) using the same semantics as
+                # assign_bin(): val < edges[0] → bin 0, val >= edges[-1] → bin len(edges)
+                col_bins = np.searchsorted(edges_arr, col_vals, side="right")
+                # side='right' gives correct semantics: edges=[30,45], val=30 → pos 1 (bin 1),
+                # val=29 → pos 0 (bin 0), val=45 → pos 2 (bin 2). This matches v2_rules'
+                # "for i, e in enumerate(edges): if val < e: return i" logic.
+                # But handle NaN/inf: searchsorted treats NaN oddly, replace with -1
+                col_bins = np.where(np.isfinite(col_vals), col_bins, -1)
+            # Check if each row's bin is in expected_bins
+            match = np.array([int(b) in expected_bins for b in col_bins])
+            fire_mask &= match
+
+        if not all_feats_present:
+            per_rule.append({
+                "pin_id": pin["pin_id"], "english": pin["english"],
+                "error": "feature_missing_in_rows",
+            })
+            continue
+
+        # Apply disqualifier if set
+        disq = pin.get("disqualifier")
+        disq_exclude_mask = np.zeros(len(df), dtype=bool)
+        if disq:
+            feat = disq["feature"]
+            thresh = disq["thresh"]
+            direction = disq["direction"]
+            if feat in df.columns:
+                col_vals = df[feat].values
+                finite = np.isfinite(col_vals)
+                if direction == "exclude_if_greater":
+                    disq_exclude_mask = finite & (col_vals > thresh)
+                elif direction == "exclude_if_less":
+                    disq_exclude_mask = finite & (col_vals < thresh)
+            fire_mask &= ~disq_exclude_mask
+
+        labels = df[label_col].values
+        n_fires = int(fire_mask.sum())
+        n_hits = int(labels[fire_mask].sum()) if n_fires > 0 else 0
+
+        if n_fires == 0:
+            per_rule.append({
+                "pin_id": pin["pin_id"],
+                "english": pin["english"],
+                "conditions": pin["conditions"],
+                "disqualifier": disq,
+                "threshold_pct": pin["threshold_pct"],
+                "horizon_hours": horizon_hours,
+                "validation_precision": pin.get("validation_precision"),
+                "overall": {"n_fires": 0, "n_hits": 0, "precision": None},
+                "by_split": {},
+                "top_fire_coins": [],
+            })
+            prog(10 + int((pi + 1) / n_pinned * 85),
+                 f"Rule {pi+1}/{n_pinned}: 0 fires")
+            continue
+
+        # Precision per split
+        by_split = {}
+        for split in ("train", "val", "test"):
+            split_col = f"is_{split}"
+            if split_col not in df.columns: continue
+            split_mask = df[split_col].astype(bool).values
+            combined = fire_mask & split_mask
+            sn = int(combined.sum())
+            sh = int(labels[combined].sum()) if sn > 0 else 0
+            by_split[split] = {
+                "n_fires": sn,
+                "n_hits": sh,
+                "precision": round(sh / sn, 4) if sn > 0 else None,
+                "base_rate": round(float(labels[split_mask].mean()), 4) if split_mask.sum() > 0 else None,
+            }
+
+        # Top-firing coins
+        fired_rows_df = df[fire_mask]
+        fire_outcomes = labels[fire_mask]
+        coin_stats = {}
+        for i, (_, r) in enumerate(fired_rows_df.iterrows()):
+            coin = r["product"]
+            if coin not in coin_stats:
+                coin_stats[coin] = {"fires": 0, "hits": 0}
+            coin_stats[coin]["fires"] += 1
+            if fire_outcomes[i]:
+                coin_stats[coin]["hits"] += 1
+        top_coins = sorted(
+            [(c, s["hits"], s["fires"]) for c, s in coin_stats.items()],
+            key=lambda x: -x[2])[:20]
+
+        base_rate_in_range = float(labels.mean())
+
+        per_rule.append({
+            "pin_id": pin["pin_id"],
+            "english": pin["english"],
+            "conditions": pin["conditions"],
+            "disqualifier": disq,
+            "threshold_pct": pin["threshold_pct"],
+            "horizon_hours": horizon_hours,
+            "validation_precision": pin.get("validation_precision"),
+            "overall": {
+                "n_fires": n_fires,
+                "n_hits": n_hits,
+                "precision": round(n_hits / n_fires, 4),
+                "base_rate_in_range": round(base_rate_in_range, 4),
+                "lift_vs_base": round(n_hits / n_fires - base_rate_in_range, 4),
+                "n_distinct_coins": len(coin_stats),
+            },
+            "by_split": by_split,
+            "top_fire_coins": top_coins,
+        })
+        prog(10 + int((pi + 1) / n_pinned * 85),
+             f"Rule {pi+1}/{n_pinned}: {n_fires} fires, {n_hits} hits")
+
+    prog(97, "Saving report...")
+    # Actual date range observed in rows
+    all_dates = [r.get("date", "") for r in rows if r.get("date")]
+    date_range = {
+        "requested_start": start_date,
+        "requested_end": end_date,
+        "actual_first": min(all_dates) if all_dates else None,
+        "actual_last": max(all_dates) if all_dates else None,
+        "n_rows": n_rows,
+        "n_distinct_dates": len(set(all_dates)) if all_dates else 0,
+    }
+    report = {
+        "_type": "coinbase_scanner_v2_backtest",
+        "backtest_id": backtest_id,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "date_range": date_range,
+        "n_pinned_rules": len(pinned_rules),
+        "n_rules_evaluated": len(per_rule),
+        "per_rule": per_rule,
+    }
+    out_dir = live_dir / "backtests"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{backtest_id}.json").write_text(json.dumps(report, default=str, indent=2))
+    prog(100, f"Done. Report saved as {backtest_id}.json")
+    return report
+
+
+def list_backtests(live_dir):
+    """Return summaries of all saved backtest runs."""
+    out_dir = live_dir / "backtests"
+    if not out_dir.exists(): return []
+    summaries = []
+    for p in sorted(out_dir.glob("bt_*.json"), reverse=True):
+        try:
+            r = json.loads(p.read_text())
+            summaries.append({
+                "backtest_id": r["backtest_id"],
+                "generated_at": r["generated_at"],
+                "n_rules_evaluated": r["n_rules_evaluated"],
+                "date_range": r.get("date_range"),
+            })
+        except Exception as e:
+            log.warning(f"list_backtests: skipping {p.name}: {e}")
+    return summaries
+
+
+def load_backtest(live_dir, backtest_id):
+    """Load a specific backtest report."""
+    p = live_dir / "backtests" / f"{backtest_id}.json"
+    if not p.exists(): return None
+    return json.loads(p.read_text())
