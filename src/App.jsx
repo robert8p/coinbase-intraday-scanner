@@ -1865,6 +1865,11 @@ function LiveTab() {
                 {pinned.map(p => {
                   const s = byRule[p.pin_id] || {};
                   const isSel = selectedPin === p.pin_id;
+                  const btP = backtestTestP[p.pin_id];
+                  // Prefer backtest P as the baseline if available, else catalog P
+                  const deltaBaseline = btP != null ? btP : p.validation_precision;
+                  const deltaVal = (s.live_precision != null && deltaBaseline != null)
+                    ? s.live_precision - deltaBaseline : null;
                   return (
                     <tr key={p.pin_id}
                       onClick={() => setSelectedPin(isSel ? null : p.pin_id)}
@@ -1896,17 +1901,8 @@ function LiveTab() {
                       <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(s.live_precision),fontWeight:700}}>
                         {s.live_precision != null ? `${(s.live_precision*100).toFixed(1)}%` : "—"}
                       </td>
-                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:(() => {
-                        // Prefer backtest as the baseline if we have it
-                        const baseline = backtestTestP[p.pin_id] ?? p.validation_precision;
-                        const d = (s.live_precision != null && baseline != null) ? (s.live_precision - baseline) : null;
-                        return deltaColor(d);
-                      })()}>
-                        {(() => {
-                          const baseline = backtestTestP[p.pin_id] ?? p.validation_precision;
-                          const d = (s.live_precision != null && baseline != null) ? (s.live_precision - baseline) : null;
-                          return d != null ? `${(d*100).toFixed(1)}pp` : "—";
-                        })()}
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:deltaColor(deltaVal)}}>
+                        {deltaVal != null ? `${(deltaVal*100).toFixed(1)}pp` : "—"}
                       </td>
                       <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
                         {s.n_hits ?? 0}/{s.n_fires_resolved ?? 0}
