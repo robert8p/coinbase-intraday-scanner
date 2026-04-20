@@ -857,3 +857,384 @@ def load_backtest(live_dir, backtest_id):
     p = live_dir / "backtests" / f"{backtest_id}.json"
     if not p.exists(): return None
     return json.loads(p.read_text())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PAPER TRADING SIMULATION
+# ═══════════════════════════════════════════════════════════════════
+#
+# Given a set of fires (from backtest or live), simulate realistic trades with
+# TP/SL exit rules, trading costs, slippage, and execution lag. Returns per-
+# fire P&L, a cumulative P&L curve, and aggregate stats.
+#
+# Key simplifications:
+#  - Each trade uses a fixed notional (configurable % of capital), independent
+#    of other concurrent trades. This assumes you have enough capital margin to
+#    run all fires concurrently. Real-world capital constraints will reduce
+#    returns below these numbers. I.e. these are OPTIMISTIC / upper bounds.
+#  - Entry: at the open of the bar FOLLOWING scan_time (models 15-min
+#    execution lag) if use_next_bar_open=True, else at the close of the bar at
+#    scan_time.
+#  - Exit: walk forward through horizon_bars, exit at whichever happens first:
+#    * TP: bar's high >= entry * (1 + tp_pct) → exit at entry * (1 + tp_pct)
+#    * SL: bar's low <= entry * (1 - sl_pct) → exit at entry * (1 - sl_pct)
+#    * Horizon end: exit at last bar's close
+#  - Costs: applied symmetrically at entry and exit (total = 2 × cost_bps).
+
+def simulate_trade(entry_price, future_bars, tp_pct, sl_pct, horizon_bars):
+    """
+    Walk forward through future_bars, return exit details.
+
+    Returns {
+      "exit_type": "tp" | "sl" | "horizon",
+      "exit_price": float,
+      "exit_bar_idx": int (0-indexed within future_bars),
+      "raw_pnl_pct": float (entry to exit, before costs),
+      "max_favorable": float,   # highest high / entry - 1
+      "max_adverse": float,     # lowest low / entry - 1
+    }
+    """
+    if entry_price <= 0 or not future_bars:
+        return None
+    tp_price = entry_price * (1.0 + tp_pct)
+    sl_price = entry_price * (1.0 - sl_pct)
+    window = future_bars[:horizon_bars]
+
+    max_high = entry_price
+    min_low = entry_price
+    for i, b in enumerate(window):
+        h = b["h"]; l = b["l"]
+        if h > max_high: max_high = h
+        if l < min_low: min_low = l
+        # Check TP and SL within this bar. If both would trigger, we assume SL
+        # wins (worst-case; we don't know intra-bar order).
+        hit_sl = (l <= sl_price)
+        hit_tp = (h >= tp_price)
+        if hit_sl and hit_tp:
+            return {
+                "exit_type": "sl",
+                "exit_price": float(sl_price),
+                "exit_bar_idx": i,
+                "raw_pnl_pct": round(float(-sl_pct), 6),
+                "max_favorable": round(float(max_high/entry_price - 1), 6),
+                "max_adverse": round(float(min_low/entry_price - 1), 6),
+            }
+        if hit_sl:
+            return {
+                "exit_type": "sl",
+                "exit_price": float(sl_price),
+                "exit_bar_idx": i,
+                "raw_pnl_pct": round(float(-sl_pct), 6),
+                "max_favorable": round(float(max_high/entry_price - 1), 6),
+                "max_adverse": round(float(min_low/entry_price - 1), 6),
+            }
+        if hit_tp:
+            return {
+                "exit_type": "tp",
+                "exit_price": float(tp_price),
+                "exit_bar_idx": i,
+                "raw_pnl_pct": round(float(tp_pct), 6),
+                "max_favorable": round(float(max_high/entry_price - 1), 6),
+                "max_adverse": round(float(min_low/entry_price - 1), 6),
+            }
+    # Horizon exit
+    exit_price = window[-1]["c"]
+    return {
+        "exit_type": "horizon",
+        "exit_price": float(exit_price),
+        "exit_bar_idx": len(window) - 1,
+        "raw_pnl_pct": round(float(exit_price / entry_price - 1), 6),
+        "max_favorable": round(float(max_high/entry_price - 1), 6),
+        "max_adverse": round(float(min_low/entry_price - 1), 6),
+    }
+
+
+def run_paper_simulation(live_dir, rows_with_bars, pinned_rules, config,
+                          progress_cb=None, sim_id=None, start_date=None,
+                          end_date=None):
+    """
+    Run a paper trading simulation across pinned rules over historical rows.
+
+    Args:
+      rows_with_bars: list of dicts; each row is a scan point with features +
+        a 'future_bars' list of the next 64 bars (enough for any horizon).
+        This is NOT what build_rows_for_rule_mining outputs; the caller must
+        augment rows with future_bars. See _build_rows_with_future_bars in
+        server.py.
+      pinned_rules: list of pinned rule dicts
+      config: {
+        "tp_pct": 0.02,              # take-profit threshold
+        "sl_pct": 0.02,              # stop-loss threshold (set to None to disable)
+        "horizon_hours": None,       # defaults to each rule's horizon
+        "cost_bps_per_side": 30,     # 0.30% per side = 0.6% round-trip
+        "slippage_bps_per_side": 10, # additional slippage
+        "use_next_bar_open": True,   # entry at open of next bar (models lag)
+        "position_size_pct": 0.05,   # 5% of capital per trade
+        "starting_capital": 10000,   # for P&L curve
+      }
+      sim_id: optional identifier; auto-generated if None
+      start_date/end_date: optional row date filtering
+
+    Returns simulation report (also persists to disk).
+    """
+    import numpy as np
+    import pandas as pd
+
+    if sim_id is None:
+        sim_id = f"sim_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    def prog(p, m):
+        if progress_cb: progress_cb(p, m)
+        log.info(f"[paper_sim] {p}% — {m}")
+
+    tp_pct = float(config.get("tp_pct", 0.02))
+    sl_pct = config.get("sl_pct")
+    if sl_pct is not None: sl_pct = float(sl_pct)
+    cost_bps_side = float(config.get("cost_bps_per_side", 30))
+    slip_bps_side = float(config.get("slippage_bps_per_side", 10))
+    use_next_open = bool(config.get("use_next_bar_open", True))
+    pos_size_pct = float(config.get("position_size_pct", 0.05))
+    starting_capital = float(config.get("starting_capital", 10000))
+    total_cost_pct = (cost_bps_side + slip_bps_side) * 2 / 10000  # round-trip
+
+    # Filter by date
+    if start_date or end_date:
+        def in_range(r):
+            d = r.get("date", "")
+            if start_date and d < start_date: return False
+            if end_date and d > end_date: return False
+            return True
+        rows_with_bars = [r for r in rows_with_bars if in_range(r)]
+
+    n_rows = len(rows_with_bars)
+    if n_rows == 0:
+        raise ValueError("No rows in date range")
+    prog(5, f"Processing {n_rows} rows × {len(pinned_rules)} rules")
+
+    df = pd.DataFrame([{k: v for k, v in r.items() if k != "future_bars"}
+                       for r in rows_with_bars])
+    # Keep future_bars in a parallel array (pandas doesn't like nested lists)
+    future_bars_arr = [r.get("future_bars", []) for r in rows_with_bars]
+    row_entry_price_arr = [r.get("entry_price_next_open", r.get("scan_close"))
+                            for r in rows_with_bars]
+    row_scan_close_arr = [r.get("scan_close") for r in rows_with_bars]
+
+    per_rule_reports = []
+    for pi, pin in enumerate(pinned_rules):
+        bin_edges = pin.get("bin_edges", {})
+        horizon_hours = int(config.get("horizon_hours") or pin["horizon_hours"])
+        horizon_bars = horizon_hours * 4  # 15-min bars
+
+        # Build fire mask (same vectorized logic as backtest)
+        fire_mask = np.ones(len(df), dtype=bool)
+        all_present = True
+        for cond in pin["conditions"]:
+            feat = cond["feature"]
+            expected = set(cond["bins"])
+            if feat not in df.columns:
+                all_present = False; break
+            edges = bin_edges.get(feat)
+            edges_arr = np.array(edges) if edges is not None else None
+            col = df[feat].values
+            if edges_arr is None:
+                bins_col = np.where(np.isfinite(col),
+                                      np.clip(col.astype(int), 0, 1), -1)
+            else:
+                bins_col = np.searchsorted(edges_arr, col, side="right")
+                bins_col = np.where(np.isfinite(col), bins_col, -1)
+            fire_mask &= np.array([int(b) in expected for b in bins_col])
+
+        if not all_present:
+            per_rule_reports.append({
+                "pin_id": pin["pin_id"], "english": pin["english"],
+                "error": "feature_missing"})
+            continue
+
+        # Disqualifier
+        disq = pin.get("disqualifier")
+        if disq and disq["feature"] in df.columns:
+            col = df[disq["feature"]].values
+            finite = np.isfinite(col)
+            if disq["direction"] == "exclude_if_greater":
+                fire_mask &= ~(finite & (col > disq["thresh"]))
+            elif disq["direction"] == "exclude_if_less":
+                fire_mask &= ~(finite & (col < disq["thresh"]))
+
+        n_fires = int(fire_mask.sum())
+        if n_fires == 0:
+            per_rule_reports.append({
+                "pin_id": pin["pin_id"], "english": pin["english"],
+                "disqualifier": disq,
+                "n_fires": 0, "trades": [],
+                "aggregate": {"n_trades": 0}})
+            prog(5 + int((pi+1)/len(pinned_rules)*90),
+                 f"Rule {pi+1}: 0 fires")
+            continue
+
+        # Simulate each fire
+        fire_idx = np.where(fire_mask)[0]
+        trades = []
+        for idx in fire_idx:
+            bars = future_bars_arr[idx]
+            entry_price = (row_entry_price_arr[idx] if use_next_open
+                            else row_scan_close_arr[idx])
+            if entry_price is None or entry_price <= 0 or len(bars) < horizon_bars:
+                # Skip — insufficient future data (end of dataset)
+                continue
+            sim = simulate_trade(entry_price, bars, tp_pct,
+                                   sl_pct if sl_pct is not None else 1.0,
+                                   horizon_bars)
+            if sim is None: continue
+            net_pnl_pct = sim["raw_pnl_pct"] - total_cost_pct
+            trades.append({
+                "date": df.iloc[idx].get("date"),
+                "scan_hour": int(df.iloc[idx].get("scan_hour", 0)),
+                "product": df.iloc[idx].get("product"),
+                "entry_price": float(entry_price),
+                "exit_type": sim["exit_type"],
+                "exit_price": sim["exit_price"],
+                "exit_bar_idx": sim["exit_bar_idx"],
+                "raw_pnl_pct": sim["raw_pnl_pct"],
+                "net_pnl_pct": round(net_pnl_pct, 6),
+                "max_favorable": sim["max_favorable"],
+                "max_adverse": sim["max_adverse"],
+                "is_train": bool(df.iloc[idx].get("is_train", False)),
+                "is_val": bool(df.iloc[idx].get("is_val", False)),
+                "is_test": bool(df.iloc[idx].get("is_test", False)),
+            })
+
+        # Aggregates
+        if not trades:
+            agg = {"n_trades": 0}
+        else:
+            pnls = [t["net_pnl_pct"] for t in trades]
+            raw_pnls = [t["raw_pnl_pct"] for t in trades]
+            exit_types = [t["exit_type"] for t in trades]
+            n = len(pnls)
+            mean_net = sum(pnls) / n
+            mean_raw = sum(raw_pnls) / n
+            wins = sum(1 for p in pnls if p > 0)
+            # Per-split
+            by_split = {}
+            for split in ("train", "val", "test"):
+                split_trades = [t for t in trades if t.get(f"is_{split}")]
+                if split_trades:
+                    sp = [t["net_pnl_pct"] for t in split_trades]
+                    by_split[split] = {
+                        "n_trades": len(sp),
+                        "mean_net_pnl_pct": round(sum(sp)/len(sp), 6),
+                        "win_rate": round(sum(1 for x in sp if x > 0)/len(sp), 4),
+                        "total_net_pct": round(sum(sp), 4),
+                    }
+            agg = {
+                "n_trades": n,
+                "mean_net_pnl_pct": round(mean_net, 6),
+                "mean_raw_pnl_pct": round(mean_raw, 6),
+                "cost_bps_per_trade": round(total_cost_pct * 10000, 1),
+                "win_rate_net": round(wins / n, 4),
+                "total_net_pct": round(sum(pnls), 4),
+                "best_trade_pct": round(max(pnls), 4),
+                "worst_trade_pct": round(min(pnls), 4),
+                "exit_types": {t: exit_types.count(t) for t in set(exit_types)},
+                "by_split": by_split,
+            }
+
+        per_rule_reports.append({
+            "pin_id": pin["pin_id"],
+            "english": pin["english"],
+            "disqualifier": disq,
+            "threshold_pct": pin["threshold_pct"],
+            "horizon_hours": horizon_hours,
+            "validation_precision": pin.get("validation_precision"),
+            "n_fires": n_fires,
+            "n_simulated": len(trades),
+            "trades": trades[:500],   # cap trade details to avoid huge JSON
+            "aggregate": agg,
+        })
+        prog(5 + int((pi+1)/len(pinned_rules)*90),
+             f"Rule {pi+1}/{len(pinned_rules)}: {len(trades)} trades, "
+             f"mean net {agg.get('mean_net_pnl_pct', 0)*100:.2f}%")
+
+    # Portfolio-level aggregation: build a P&L curve across ALL trades chronologically
+    prog(97, "Computing portfolio P&L curve")
+    all_trades = []
+    for r in per_rule_reports:
+        for t in r.get("trades", []):
+            all_trades.append({**t, "pin_id": r["pin_id"]})
+    all_trades.sort(key=lambda t: (t.get("date", ""), t.get("scan_hour", 0)))
+
+    # Equity curve: assume each trade uses pos_size_pct of starting capital,
+    # and P&L compounds per trade sequentially. (Simplistic — real-world
+    # multi-trade concurrency would require different accounting.)
+    equity = starting_capital
+    curve = []
+    for t in all_trades:
+        pnl_usd = equity * pos_size_pct * t["net_pnl_pct"]
+        equity += pnl_usd
+        curve.append({"date": t.get("date"), "pin_id": t.get("pin_id"),
+                       "product": t.get("product"), "net_pnl_pct": t["net_pnl_pct"],
+                       "pnl_usd": round(pnl_usd, 2), "equity": round(equity, 2)})
+    max_equity = starting_capital
+    max_dd = 0.0
+    for c in curve:
+        if c["equity"] > max_equity: max_equity = c["equity"]
+        dd = (c["equity"] - max_equity) / max_equity
+        if dd < max_dd: max_dd = dd
+
+    portfolio = {
+        "starting_capital": starting_capital,
+        "final_equity": round(equity, 2),
+        "total_return_pct": round((equity/starting_capital - 1) * 100, 2),
+        "n_trades": len(all_trades),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "position_size_pct": pos_size_pct,
+    }
+
+    # Actual date range
+    dates = [t.get("date", "") for t in all_trades if t.get("date")]
+    date_range = {
+        "requested_start": start_date,
+        "requested_end": end_date,
+        "actual_first": min(dates) if dates else None,
+        "actual_last": max(dates) if dates else None,
+    }
+    report = {
+        "_type": "coinbase_scanner_v2_paper_sim",
+        "sim_id": sim_id,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "config": config,
+        "date_range": date_range,
+        "n_pinned_rules": len(pinned_rules),
+        "portfolio": portfolio,
+        "per_rule": per_rule_reports,
+        "equity_curve": curve[:5000],   # cap
+    }
+    out_dir = live_dir / "paper_sims"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{sim_id}.json").write_text(json.dumps(report, default=str, indent=2))
+    prog(100, f"Done. {len(all_trades)} trades, final equity ${equity:.0f}")
+    return report
+
+
+def list_paper_sims(live_dir):
+    out_dir = live_dir / "paper_sims"
+    if not out_dir.exists(): return []
+    out = []
+    for p in sorted(out_dir.glob("sim_*.json"), reverse=True):
+        try:
+            r = json.loads(p.read_text())
+            out.append({
+                "sim_id": r["sim_id"],
+                "generated_at": r["generated_at"],
+                "config": r.get("config", {}),
+                "portfolio": r.get("portfolio", {}),
+                "n_pinned_rules": r.get("n_pinned_rules", 0),
+            })
+        except Exception as e:
+            log.warning(f"list_paper_sims: skipping {p.name}: {e}")
+    return out
+
+
+def load_paper_sim(live_dir, sim_id):
+    p = live_dir / "paper_sims" / f"{sim_id}.json"
+    if not p.exists(): return None
+    return json.loads(p.read_text())

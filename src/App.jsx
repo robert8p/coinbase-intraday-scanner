@@ -1636,6 +1636,26 @@ function LiveTab() {
   const [selectedPin, setSelectedPin] = useState(null);   // pin_id filter for fires
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [backtestTestP, setBacktestTestP] = useState({}); // pin_id -> test precision from most recent backtest
+
+  // Load the most recent backtest report's test precisions (for comparison column).
+  // Done once on mount + whenever pinned rules change.
+  useEffect(() => {
+    fetch('/api/v2/live/backtest/list').then(r => r.json()).then(async d => {
+      const list = d.backtests || [];
+      if (list.length === 0) return;
+      // list is sorted newest first
+      const newest = list[0];
+      const r2 = await fetch(`/api/v2/live/backtest/${newest.backtest_id}`);
+      const report = await r2.json();
+      const map = {};
+      for (const rr of (report.per_rule || [])) {
+        const tp = (rr.by_split?.test || {}).precision;
+        if (tp != null) map[rr.pin_id] = tp;
+      }
+      setBacktestTestP(map);
+    }).catch(() => {});
+  }, [pinned.length]);
 
   // Poll every 10s for everything; 3s for scan status while active
   useEffect(() => {
@@ -1785,6 +1805,40 @@ function LiveTab() {
           )}
         </div>
 
+        {/* Prune-to-winners quick action — only show if there are >3 pins */}
+        {pinned.length > 3 && (
+          <div style={{padding:"8px 10px",marginBottom:10,
+            background:"rgba(245,158,11,0.06)",border:"1px solid rgba(245,158,11,0.2)",
+            borderRadius:4,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+            <span style={{fontSize:11,color:"#f59e0b"}}>⚡ Quick action:</span>
+            <span style={{fontSize:11,color:"#94a3b8"}}>
+              Based on backtest analysis, keep only the 2 rules that generalize on test.
+            </span>
+            <span style={{flex:1}}/>
+            <Btn onClick={async () => {
+              const keepIds = [
+                "11c305c85a8e",                                       // pattern 1 unrefined, 2-condition (simplest), Test P 65.6%
+                "7447e71f2ab7_dq_resistance_dist_atr_exclude_if_greater", // pattern 2 refined w/ best DQ threshold, Test P 61.6%
+              ];
+              if (!confirm(`Keep only these 2 pinned rules (the ones that generalize on test):\n\n`
+                + `  • bb_width + rsi_14 (Test P 65.6%, Train→Test gap -0.5pp, 343 test fires)\n`
+                + `  • bb_width + support_dist_atr +DQ(resistance ≤ 2.125) (Test P 61.6%, 125 test fires)\n\n`
+                + `Unpin everything else? Fire/outcome history is preserved.`)) return;
+              try {
+                const r = await fetch('/api/v2/live/unpin_except', {
+                  method: 'POST', headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({keep_pin_ids: keepIds}),
+                });
+                const d = await r.json();
+                if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+                alert(`Kept: ${d.kept}\nUnpinned: ${d.unpinned}\n\nKept pin_ids:\n  • ${d.kept_pin_ids.join('\n  • ')}`);
+              } catch (e) { alert(e.message); }
+            }} color="#f59e0b" style={{padding:"4px 10px",fontSize:10,fontWeight:700}}>
+              🎯 Keep only the 2 generalizing rules
+            </Btn>
+          </div>
+        )}
+
         {pinned.length === 0 ? (
           <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
             No pinned rules. Go to the <span style={{color:"#8b5cf6",fontWeight:600}}>Rules tab</span>,
@@ -1797,9 +1851,10 @@ function LiveTab() {
                 <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
                   <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Rule</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Threshold/H</th>
-                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Val P</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="Precision from mining's held-out test slice (stored with the rule)">Catalog P</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="Test-slice precision from most recent backtest run">Backtest P</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Live P</th>
-                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Δ</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="Live P minus Backtest P (if available) else Live P minus Catalog P">Δ</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Hits/Res</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Pending</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Avg Max%</th>
@@ -1835,11 +1890,23 @@ function LiveTab() {
                       <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(p.validation_precision),fontWeight:600}}>
                         {p.validation_precision != null ? `${(p.validation_precision*100).toFixed(1)}%` : "—"}
                       </td>
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(backtestTestP[p.pin_id]),fontWeight:600}}>
+                        {backtestTestP[p.pin_id] != null ? `${(backtestTestP[p.pin_id]*100).toFixed(1)}%` : "—"}
+                      </td>
                       <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:precColor(s.live_precision),fontWeight:700}}>
                         {s.live_precision != null ? `${(s.live_precision*100).toFixed(1)}%` : "—"}
                       </td>
-                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:deltaColor(s.precision_delta)}}>
-                        {s.precision_delta != null ? `${(s.precision_delta*100).toFixed(1)}pp` : "—"}
+                      <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:(() => {
+                        // Prefer backtest as the baseline if we have it
+                        const baseline = backtestTestP[p.pin_id] ?? p.validation_precision;
+                        const d = (s.live_precision != null && baseline != null) ? (s.live_precision - baseline) : null;
+                        return deltaColor(d);
+                      })()}>
+                        {(() => {
+                          const baseline = backtestTestP[p.pin_id] ?? p.validation_precision;
+                          const d = (s.live_precision != null && baseline != null) ? (s.live_precision - baseline) : null;
+                          return d != null ? `${(d*100).toFixed(1)}pp` : "—";
+                        })()}
                       </td>
                       <td style={{padding:"6px 8px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
                         {s.n_hits ?? 0}/{s.n_fires_resolved ?? 0}
@@ -1864,9 +1931,10 @@ function LiveTab() {
 
         {pinned.length > 0 && (
           <div style={{fontSize:10,color:"#475569",marginTop:10,lineHeight:1.6}}>
-            <span style={{color:"#22c55e"}}>Green Δ</span>: live precision within 5pp of validation (healthy).{" "}
-            <span style={{color:"#eab308"}}>Yellow Δ</span>: 5-15pp below (warning).{" "}
-            <span style={{color:"#ef4444"}}>Red Δ</span>: &gt;15pp below (signal likely collapsed).{" "}
+            Δ compares Live P to <b>Backtest P</b> if backtest has run, else Catalog P.{" "}
+            <span style={{color:"#22c55e"}}>Green</span>: within 5pp of baseline (healthy).{" "}
+            <span style={{color:"#eab308"}}>Yellow</span>: 5-15pp below (warning).{" "}
+            <span style={{color:"#ef4444"}}>Red</span>: &gt;15pp below (signal likely collapsed).{" "}
             Click a row to filter fires by that rule.
           </div>
         )}
@@ -1950,6 +2018,9 @@ function LiveTab() {
 
       {/* ── BACKTEST ── */}
       <BacktestPanel pinned={pinned} />
+
+      {/* ── PAPER TRADING SIMULATION ── */}
+      <PaperSimPanel pinned={pinned} />
     </div>
   );
 }
@@ -2215,6 +2286,301 @@ function BacktestPanel({ pinned }) {
       {!selectedReport && !btStatus.inProgress && history.length === 0 && (
         <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
           No backtests run yet. Click <b>Run Backtest</b> above to start one.
+        </div>
+      )}
+    </Box>
+  );
+}
+
+// ─── PAPER SIMULATION PANEL ──────────────────────────────────────
+// Replays rule fires with realistic TP/SL exits + trading costs.
+// This is the "does this actually make money after frictions" check.
+
+function PaperSimPanel({ pinned }) {
+  const [tpPct, setTpPct] = useState(2.0);
+  const [slPct, setSlPct] = useState(2.0);
+  const [costBps, setCostBps] = useState(30);
+  const [slipBps, setSlipBps] = useState(10);
+  const [useNextOpen, setUseNextOpen] = useState(true);
+  const [posPct, setPosPct] = useState(5.0);
+  const [capital, setCapital] = useState(10000);
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [status, setStatus] = useState({inProgress: false, progress: {pct:0, msg:"idle"}});
+  const [history, setHistory] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [selectedReport, setSelectedReport] = useState(null);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    const load = () => {
+      fetch('/api/v2/live/paper_sim/status').then(r => r.json())
+        .then(setStatus).catch(() => {});
+      fetch('/api/v2/live/paper_sim/list').then(r => r.json())
+        .then(d => setHistory(d.sims || [])).catch(() => {});
+    };
+    load();
+    const iv = setInterval(load, status.inProgress ? 2000 : 15000);
+    return () => clearInterval(iv);
+  }, [status.inProgress]);
+
+  useEffect(() => {
+    if (!selected && history.length > 0 && !status.inProgress) {
+      setSelected(history[0].sim_id);
+    }
+  }, [history, status.inProgress]);
+
+  useEffect(() => {
+    if (!selected) { setSelectedReport(null); return; }
+    fetch(`/api/v2/live/paper_sim/${selected}`).then(r => r.json())
+      .then(setSelectedReport).catch(() => {});
+  }, [selected]);
+
+  const runSim = async () => {
+    setError(null);
+    const body = {
+      tp_pct: tpPct / 100, sl_pct: slPct / 100,
+      cost_bps_per_side: costBps, slippage_bps_per_side: slipBps,
+      use_next_bar_open: useNextOpen,
+      position_size_pct: posPct / 100, starting_capital: capital,
+    };
+    if (startDate) body.start_date = startDate;
+    if (endDate) body.end_date = endDate;
+    try {
+      const r = await fetch('/api/v2/live/paper_sim', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (d.status === 'already_in_progress') setError("Simulation already in progress");
+    } catch (e) { setError(e.message); }
+  };
+
+  const pnlColor = (pct) => pct == null ? "#64748b"
+    : pct > 0.005 ? "#22c55e" : pct < -0.005 ? "#ef4444" : "#eab308";
+
+  const pf = selectedReport?.portfolio || {};
+  const rules = selectedReport?.per_rule || [];
+
+  return (
+    <Box>
+      <div style={{marginBottom:12}}>
+        <Lbl>💵 Paper Trading Simulation</Lbl>
+        <div style={{fontSize:11,color:"#94a3b8",marginTop:6,lineHeight:1.6}}>
+          Replays every rule fire as a paper trade with realistic exits (TP/SL),
+          trading costs (Coinbase taker fees), slippage, and execution lag (next-bar-open entry).
+          This is the honest "does this make money" check — precision alone isn't enough.
+          Defaults: +2%/-2% TP/SL, 30 bps per-side cost, 10 bps slippage (0.8% round-trip), 5% size per trade.
+        </div>
+      </div>
+
+      {/* Config */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",
+        gap:8,padding:"10px",marginBottom:10,background:"rgba(34,197,94,0.06)",
+        border:"1px solid rgba(34,197,94,0.15)",borderRadius:4}}>
+        <div>
+          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>TP %</div>
+          <input type="number" step="0.1" value={tpPct} onChange={e => setTpPct(parseFloat(e.target.value) || 0)}
+            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>SL %</div>
+          <input type="number" step="0.1" value={slPct} onChange={e => setSlPct(parseFloat(e.target.value) || 0)}
+            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Cost bps (per side)</div>
+          <input type="number" value={costBps} onChange={e => setCostBps(parseFloat(e.target.value) || 0)}
+            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Slippage bps</div>
+          <input type="number" value={slipBps} onChange={e => setSlipBps(parseFloat(e.target.value) || 0)}
+            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Position size %</div>
+          <input type="number" step="0.5" value={posPct} onChange={e => setPosPct(parseFloat(e.target.value) || 0)}
+            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        </div>
+        <div>
+          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Starting capital $</div>
+          <input type="number" value={capital} onChange={e => setCapital(parseFloat(e.target.value) || 0)}
+            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+        </div>
+        <div style={{display:"flex",alignItems:"flex-end"}}>
+          <label style={{fontSize:10,color:"#94a3b8",cursor:"pointer",userSelect:"none"}}>
+            <input type="checkbox" checked={useNextOpen} onChange={e => setUseNextOpen(e.target.checked)}
+              style={{marginRight:6}}/>
+            Entry at next-bar open (model exec lag)
+          </label>
+        </div>
+      </div>
+
+      <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+        <span style={{fontSize:10,color:"#64748b"}}>Date range (optional):</span>
+        <input type="date" value={startDate} onChange={e => setStartDate(e.target.value)}
+          style={{padding:"3px 6px",fontSize:10,background:"#0c0f14",color:"#e2e8f0",
+            border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}}/>
+        <span style={{fontSize:9,color:"#64748b"}}>to</span>
+        <input type="date" value={endDate} onChange={e => setEndDate(e.target.value)}
+          style={{padding:"3px 6px",fontSize:10,background:"#0c0f14",color:"#e2e8f0",
+            border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}}/>
+        <span style={{flex:1}}/>
+        <Btn onClick={runSim} disabled={status.inProgress || pinned.length === 0}
+          color="#22c55e" style={{padding:"5px 14px",fontSize:11,fontWeight:700}}>
+          {status.inProgress ? `Running ${status.progress?.pct ?? 0}%...` : "💵 Run Paper Simulation"}
+        </Btn>
+      </div>
+
+      {status.inProgress && (
+        <div style={{marginBottom:10}}>
+          <div style={{background:"rgba(34,197,94,0.15)",borderRadius:3,height:6,overflow:"hidden"}}>
+            <div style={{width:`${status.progress?.pct ?? 0}%`,height:6,background:"#22c55e",transition:"width 0.3s"}}/>
+          </div>
+          <div style={{fontSize:10,color:"#22c55e",marginTop:4}}>{status.progress?.msg ?? "..."}</div>
+        </div>
+      )}
+
+      {error && (
+        <div style={{marginBottom:10,padding:"6px 10px",borderRadius:4,background:"rgba(239,68,68,0.1)",
+          border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:11}}>{error}</div>
+      )}
+
+      {/* History */}
+      {history.length > 0 && (
+        <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+          <span style={{fontSize:10,color:"#64748b"}}>Past runs:</span>
+          {history.slice(0, 5).map(h => (
+            <span key={h.sim_id} onClick={() => setSelected(h.sim_id)}
+              style={{padding:"3px 8px",fontSize:10,cursor:"pointer",borderRadius:3,
+                background: selected === h.sim_id ? "rgba(34,197,94,0.25)" : "rgba(255,255,255,0.05)",
+                border: selected === h.sim_id ? "1px solid #22c55e" : "1px solid rgba(255,255,255,0.08)",
+                color: selected === h.sim_id ? "#d1fae5" : "#94a3b8"}}>
+              {new Date(h.generated_at).toLocaleString()} — TP{(h.config?.tp_pct*100 || 2).toFixed(1)}%/
+              SL{(h.config?.sl_pct*100 || 2).toFixed(1)}% — {h.portfolio?.total_return_pct?.toFixed(1) ?? "?"}%
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Portfolio summary */}
+      {selectedReport && (
+        <>
+          <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:14,padding:"10px",
+            background:"rgba(168,85,247,0.06)",border:"1px solid rgba(168,85,247,0.15)",borderRadius:4}}>
+            <div style={{flex:"1 1 120px"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Start → End</div>
+              <div style={{fontSize:12,color:"#e2e8f0",fontWeight:600,fontVariantNumeric:"tabular-nums"}}>
+                ${pf.starting_capital?.toLocaleString()} → ${pf.final_equity?.toLocaleString()}
+              </div>
+            </div>
+            <div style={{flex:"1 1 120px"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Total Return</div>
+              <div style={{fontSize:14,fontWeight:700,color:pnlColor(pf.total_return_pct/100),fontVariantNumeric:"tabular-nums"}}>
+                {pf.total_return_pct?.toFixed(2) ?? "—"}%
+              </div>
+            </div>
+            <div style={{flex:"1 1 120px"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Max Drawdown</div>
+              <div style={{fontSize:12,color:"#ef4444",fontWeight:600,fontVariantNumeric:"tabular-nums"}}>
+                {pf.max_drawdown_pct?.toFixed(2) ?? "—"}%
+              </div>
+            </div>
+            <div style={{flex:"1 1 100px"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Trades</div>
+              <div style={{fontSize:12,color:"#e2e8f0",fontWeight:600,fontVariantNumeric:"tabular-nums"}}>
+                {pf.n_trades?.toLocaleString() ?? "—"}
+              </div>
+            </div>
+            <div style={{flex:"1 1 100px"}}>
+              <div style={{fontSize:9,color:"#64748b",textTransform:"uppercase"}}>Pos size</div>
+              <div style={{fontSize:12,color:"#e2e8f0",fontVariantNumeric:"tabular-nums"}}>
+                {(pf.position_size_pct*100)?.toFixed(1) ?? "—"}%
+              </div>
+            </div>
+            <Btn onClick={() => {
+              const blob = new Blob([JSON.stringify(selectedReport, null, 2)], {type:"application/json"});
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement("a"); a.href = url; a.download = `${selectedReport.sim_id}.json`;
+              document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+            }} color="#a855f7" style={{padding:"3px 8px",fontSize:10}}>⬇ Download</Btn>
+          </div>
+
+          {/* Per-rule breakdown */}
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+              <thead>
+                <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
+                  <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Rule</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Trades</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="Mean P&L per trade before costs">Raw/trade</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="Mean P&L per trade after costs">Net/trade</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Win rate</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Total net</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Test net</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Exits</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rules.sort((a,b) => (b.aggregate?.total_net_pct || 0) - (a.aggregate?.total_net_pct || 0)).map(r => {
+                  const agg = r.aggregate || {};
+                  const ts = agg.by_split?.test || {};
+                  return (
+                    <tr key={r.pin_id} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                      <td style={{padding:"4px 6px",maxWidth:330}}>
+                        <div style={{fontSize:11,color:"#e2e8f0",fontFamily:F,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>
+                          {r.english}
+                          {r.disqualifier && <span style={{color:"#f97316",marginLeft:4,fontSize:10}}>[+DQ]</span>}
+                        </div>
+                        <div style={{fontSize:9,color:"#475569",fontFamily:F}}>{r.pin_id.slice(0,30)}</div>
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                        {agg.n_trades ?? 0}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:pnlColor(agg.mean_raw_pnl_pct)}}>
+                        {agg.mean_raw_pnl_pct != null ? `${(agg.mean_raw_pnl_pct*100).toFixed(2)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",fontWeight:700,color:pnlColor(agg.mean_net_pnl_pct)}}>
+                        {agg.mean_net_pnl_pct != null ? `${(agg.mean_net_pnl_pct*100).toFixed(2)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
+                        {agg.win_rate_net != null ? `${(agg.win_rate_net*100).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",fontWeight:700,color:pnlColor(agg.total_net_pct/100)}}>
+                        {agg.total_net_pct != null ? `${agg.total_net_pct.toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:pnlColor(ts.total_net_pct/100)}}>
+                        {ts.total_net_pct != null ? `${ts.total_net_pct.toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{padding:"4px 6px",textAlign:"right",fontSize:9,color:"#64748b",fontFamily:F}}>
+                        {agg.exit_types ? Object.entries(agg.exit_types).map(([k,v]) => `${k[0]}${v}`).join("/") : "—"}
+                      </td>
+                    </tr>);
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{fontSize:10,color:"#475569",marginTop:10,lineHeight:1.6}}>
+            <b>Raw/trade</b>: mean P&L per trade before costs.{" "}
+            <b>Net/trade</b>: after {(selectedReport.config?.cost_bps_per_side + selectedReport.config?.slippage_bps_per_side)*2 / 100}% round-trip costs.{" "}
+            <b>Total net</b>: sum of all trade P&Ls (not compounded, not capital-adjusted).{" "}
+            <b>Test net</b>: same but restricted to the test-split rows (most honest number).{" "}
+            <b>Exits</b>: t=TP, s=SL, h=horizon.
+          </div>
+        </>
+      )}
+
+      {!selectedReport && !status.inProgress && history.length === 0 && (
+        <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
+          No simulations run yet. Adjust config above and click <b>Run Paper Simulation</b>.
         </div>
       )}
     </Box>

@@ -1,7 +1,7 @@
 {
   "name": "coinbase-intraday-scanner",
   "private": true,
-  "version": "2.3.4-stage3",
+  "version": "2.4.0-stage3",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -2315,6 +2315,20 @@ def v2_live_unpin_all():
     v2_live_module.save_pinned_rules(V2_LIVE_DIR, [])
     return {"status": "unpinned_all", "count": n}
 
+class V2UnpinExceptRequest(BaseModel):
+    keep_pin_ids: list   # pin_ids to keep; unpin all others
+
+@app.post("/api/v2/live/unpin_except")
+def v2_live_unpin_except(req: V2UnpinExceptRequest):
+    """Keep only the listed pin_ids; unpin everything else. Keeps history."""
+    pinned = v2_live_module.load_pinned_rules(V2_LIVE_DIR)
+    keep_set = set(req.keep_pin_ids)
+    kept = [r for r in pinned if r["pin_id"] in keep_set]
+    unpinned_count = len(pinned) - len(kept)
+    v2_live_module.save_pinned_rules(V2_LIVE_DIR, kept)
+    return {"status": "ok", "kept": len(kept), "unpinned": unpinned_count,
+             "kept_pin_ids": [r["pin_id"] for r in kept]}
+
 @app.delete("/api/v2/live/pin/{pin_id}")
 def v2_live_unpin(pin_id: str):
     ok = v2_live_module.unpin_rule(V2_LIVE_DIR, pin_id)
@@ -2466,6 +2480,160 @@ def v2_live_backtest_load(backtest_id: str):
     r = v2_live_module.load_backtest(V2_LIVE_DIR, backtest_id)
     if r is None:
         return JSONResponse({"error": "not found"}, 404)
+    return r
+
+# ═══ Paper-simulation endpoints ═══
+# Paper sim takes the same cached bars the backtest uses, rebuilds rule-mining
+# rows, augments each row with its post-scan future bars (for TP/SL walkthrough),
+# then runs run_paper_simulation. Saves to live_dir/paper_sims/{id}.json.
+
+v2_papersim_in_progress = False
+v2_papersim_progress = {"pct": 0, "msg": "idle"}
+
+def _attach_future_bars_to_rows(rows, intraday_bars, horizon_hours_max):
+    """
+    For each row (which has date + scan_hour + product), find the next
+    `horizon_hours_max * 4` bars from intraday_bars[product] AFTER scan_time.
+    Attach as row["future_bars"], row["scan_close"], row["entry_price_next_open"].
+
+    Modifies rows in place and returns the count augmented.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+    horizon_bars_max = int(horizon_hours_max * 4) + 8   # extra buffer
+    # Pre-index bars by product with sorted timestamps
+    sorted_bars_by_product = {}
+    for prod, bars in intraday_bars.items():
+        sb = sorted(bars, key=lambda b: b["t"])
+        sorted_bars_by_product[prod] = sb
+        # Build parallel timestamp list for bisect
+    from bisect import bisect_left
+
+    augmented = 0
+    for row in rows:
+        prod = row.get("product")
+        date = row.get("date")
+        scan_hour = int(row.get("scan_hour", 0))
+        if prod is None or date is None: continue
+        bars = sorted_bars_by_product.get(prod, [])
+        if not bars: continue
+        # scan_time ISO string (UTC)
+        scan_time_iso = f"{date}T{scan_hour:02d}:00:00Z"
+        # Find bar index at or just before scan_time
+        ts_list = [b["t"] for b in bars]
+        pos = bisect_left(ts_list, scan_time_iso)
+        # "Bar at scan time": the bar starting at or just after scan_time_iso.
+        # We want scan_close = close of the bar AT scan_time, entry_next_open =
+        # open of bar AFTER scan_time (the one we'd actually enter at).
+        if pos >= len(bars): continue
+        # Bar at scan time = bars[pos] if bars[pos].t == scan_time_iso,
+        # else bars[pos-1] if pos>0. Safer: pos is first bar >= scan_time, so
+        # the "scan bar" is bars[pos] assuming bars align to 15-min boundaries.
+        if pos + 1 >= len(bars): continue   # no next bar → no entry
+        scan_close = bars[pos]["c"] if pos < len(bars) else None
+        entry_next_open = bars[pos+1]["o"] if pos+1 < len(bars) else None
+        future = bars[pos+1:pos+1+horizon_bars_max]
+        if len(future) < int(horizon_hours_max * 4):
+            # Insufficient future data — skip (end of cached window)
+            continue
+        row["scan_close"] = float(scan_close) if scan_close else None
+        row["entry_price_next_open"] = float(entry_next_open) if entry_next_open else None
+        row["future_bars"] = future
+        augmented += 1
+    return augmented
+
+
+def _v2_run_paper_sim_bg(pin_ids, config, start_date, end_date):
+    global v2_papersim_in_progress, v2_papersim_progress
+    if v2_papersim_in_progress: return
+    v2_papersim_in_progress = True
+    v2_papersim_progress = {"pct": 0, "msg": "starting"}
+    try:
+        def cb(p, m):
+            global v2_papersim_progress
+            v2_papersim_progress = {"pct": p, "msg": m}
+
+        cb(1, "loading pinned rules")
+        pinned = v2_live_module.load_pinned_rules(V2_LIVE_DIR)
+        if pin_ids:
+            pinned = [p for p in pinned if p["pin_id"] in set(pin_ids)]
+        if not pinned:
+            v2_papersim_progress = {"pct": 100, "msg": "no_pinned_rules"}
+            return
+
+        horizon_list = sorted(set(p["horizon_hours"] for p in pinned))
+        max_horizon = max(horizon_list)
+
+        cb(2, "loading cached bars")
+        if not BARS_INTRADAY_CACHE.exists() or not BARS_DAILY_CACHE.exists():
+            v2_papersim_progress = {"pct": 100, "msg": "no_cached_bars"}
+            return
+        intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+        daily = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+
+        threshold_pct = max(p["threshold_pct"] for p in pinned)
+        cb(3, f"building rows for horizons {horizon_list}")
+        rows, _ = v2_module.build_rows_for_rule_mining(
+            intraday_bars=intraday, daily_bars=daily,
+            products=PRODUCTS, categories=CATEGORIES, benchmark=BENCHMARK,
+            scan_hours=SCAN_HOURS, horizon_hours_list=horizon_list,
+            pct_threshold=threshold_pct,
+            progress_cb=lambda p, m: cb(3 + int(p*0.05), f"rows: {m}"),
+        )
+        cb(9, f"attaching future bars to {len(rows)} rows")
+        aug = _attach_future_bars_to_rows(rows, intraday, max_horizon)
+        rows = [r for r in rows if "future_bars" in r]
+        cb(10, f"{aug}/{len(rows)+aug} rows have sufficient future data; "
+              f"starting paper simulation")
+
+        v2_live_module.run_paper_simulation(
+            V2_LIVE_DIR, rows, pinned, config,
+            progress_cb=cb, start_date=start_date, end_date=end_date,
+        )
+    except Exception as e:
+        log.exception(f"paper sim failed: {e}")
+        v2_papersim_progress = {"pct": 100, "msg": f"error: {e}"}
+    finally:
+        v2_papersim_in_progress = False
+
+class V2PaperSimRequest(BaseModel):
+    pin_ids: list = None
+    start_date: str = None
+    end_date: str = None
+    tp_pct: float = 0.02
+    sl_pct: float = 0.02
+    cost_bps_per_side: float = 30
+    slippage_bps_per_side: float = 10
+    use_next_bar_open: bool = True
+    position_size_pct: float = 0.05
+    starting_capital: float = 10000
+
+@app.post("/api/v2/live/paper_sim")
+def v2_live_paper_sim(req: V2PaperSimRequest, bg: BackgroundTasks):
+    if v2_papersim_in_progress:
+        return JSONResponse({"status": "already_in_progress"}, 409)
+    config = {
+        "tp_pct": req.tp_pct, "sl_pct": req.sl_pct,
+        "cost_bps_per_side": req.cost_bps_per_side,
+        "slippage_bps_per_side": req.slippage_bps_per_side,
+        "use_next_bar_open": req.use_next_bar_open,
+        "position_size_pct": req.position_size_pct,
+        "starting_capital": req.starting_capital,
+    }
+    bg.add_task(_v2_run_paper_sim_bg, req.pin_ids, config, req.start_date, req.end_date)
+    return {"status": "started"}
+
+@app.get("/api/v2/live/paper_sim/status")
+def v2_live_paper_sim_status():
+    return {"inProgress": v2_papersim_in_progress, "progress": v2_papersim_progress}
+
+@app.get("/api/v2/live/paper_sim/list")
+def v2_live_paper_sim_list():
+    return {"sims": v2_live_module.list_paper_sims(V2_LIVE_DIR)}
+
+@app.get("/api/v2/live/paper_sim/{sim_id}")
+def v2_live_paper_sim_load(sim_id: str):
+    r = v2_live_module.load_paper_sim(V2_LIVE_DIR, sim_id)
+    if r is None: return JSONResponse({"error": "not found"}, 404)
     return r
 
 # SPA fallback
