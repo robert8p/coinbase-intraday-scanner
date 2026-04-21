@@ -2601,11 +2601,18 @@ class V2PaperSimRequest(BaseModel):
     end_date: str = None
     tp_pct: float = 0.02
     sl_pct: float = 0.02
+    position_size_pct: float = 0.05
+    starting_capital: float = 10000
+    execution_mode: str = "taker_market"   # or "maker_limit"
+    # Taker-mode fields
     cost_bps_per_side: float = 30
     slippage_bps_per_side: float = 10
     use_next_bar_open: bool = True
-    position_size_pct: float = 0.05
-    starting_capital: float = 10000
+    # Maker-mode fields
+    maker_fee_bps: float = 25
+    taker_fee_bps: float = 40
+    maker_slippage_bps: float = 2
+    taker_slippage_bps: float = 15
 
 @app.post("/api/v2/live/paper_sim")
 def v2_live_paper_sim(req: V2PaperSimRequest, bg: BackgroundTasks):
@@ -2613,12 +2620,23 @@ def v2_live_paper_sim(req: V2PaperSimRequest, bg: BackgroundTasks):
         return JSONResponse({"status": "already_in_progress"}, 409)
     config = {
         "tp_pct": req.tp_pct, "sl_pct": req.sl_pct,
-        "cost_bps_per_side": req.cost_bps_per_side,
-        "slippage_bps_per_side": req.slippage_bps_per_side,
-        "use_next_bar_open": req.use_next_bar_open,
         "position_size_pct": req.position_size_pct,
         "starting_capital": req.starting_capital,
+        "execution_mode": req.execution_mode,
     }
+    if req.execution_mode == "maker_limit":
+        config.update({
+            "maker_fee_bps": req.maker_fee_bps,
+            "taker_fee_bps": req.taker_fee_bps,
+            "maker_slippage_bps": req.maker_slippage_bps,
+            "taker_slippage_bps": req.taker_slippage_bps,
+        })
+    else:
+        config.update({
+            "cost_bps_per_side": req.cost_bps_per_side,
+            "slippage_bps_per_side": req.slippage_bps_per_side,
+            "use_next_bar_open": req.use_next_bar_open,
+        })
     bg.add_task(_v2_run_paper_sim_bg, req.pin_ids, config, req.start_date, req.end_date)
     return {"status": "started"}
 

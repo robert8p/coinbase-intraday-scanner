@@ -949,6 +949,110 @@ def simulate_trade(entry_price, future_bars, tp_pct, sl_pct, horizon_bars):
     }
 
 
+def simulate_trade_maker(limit_entry_price, future_bars, tp_pct, sl_pct,
+                          horizon_bars):
+    """
+    Maker-execution variant. Models realistic limit-order flow:
+
+      - ENTRY: post a buy limit at `limit_entry_price`. Fills IFF a future bar
+        trades at or below that price (bar.low <= limit_entry_price). If no
+        bar reaches the limit in the horizon, NO FILL — returns None (trade
+        never happened, no P&L).
+
+      - Once filled, walk remaining bars for exit:
+        * TP: limit sell at entry * (1 + tp_pct). Fills if a future bar's
+          high >= tp_price. Classified "tp_maker" — maker fee on both sides.
+        * SL: market stop when bar's low <= entry * (1 - sl_pct).
+          Classified "sl_taker" — maker fee entry, taker fee exit.
+        * Horizon: market exit at last bar's close.
+          Classified "horizon_taker" — maker fee entry, taker fee exit.
+
+    Returns dict with same fields as simulate_trade PLUS:
+      "fill_bar_idx": int - which bar filled the entry (0-indexed)
+      "fill_price": float - always equals limit_entry_price
+
+    Or returns None if no fill.
+
+    Caller applies asymmetric fees based on exit_type. The naming convention
+    "tp_maker" vs "sl_taker" vs "horizon_taker" is the signal.
+    """
+    if limit_entry_price <= 0 or not future_bars:
+        return None
+    window = future_bars[:horizon_bars]
+
+    # Step 1: find entry fill
+    fill_idx = None
+    for i, b in enumerate(window):
+        if b["l"] <= limit_entry_price:
+            fill_idx = i
+            break
+    if fill_idx is None:
+        return None   # limit never filled
+
+    entry_price = float(limit_entry_price)
+    tp_price = entry_price * (1.0 + tp_pct)
+    sl_price = entry_price * (1.0 - sl_pct)
+
+    # Step 2: walk remaining bars for exit. Start at fill_idx (same bar) but
+    # only track high/low AFTER fill. We approximate by looking at bars from
+    # fill_idx+1 onwards — simplification: we assume the entry fill is the
+    # last price-making event within the fill bar. Slightly pessimistic.
+    max_high = entry_price
+    min_low = entry_price
+    for i in range(fill_idx + 1, len(window)):
+        b = window[i]
+        h = b["h"]; l = b["l"]
+        if h > max_high: max_high = h
+        if l < min_low: min_low = l
+        hit_sl = (l <= sl_price)
+        hit_tp = (h >= tp_price)
+        if hit_sl and hit_tp:
+            return {
+                "exit_type": "sl_taker",
+                "exit_price": float(sl_price),
+                "exit_bar_idx": i,
+                "fill_bar_idx": fill_idx,
+                "fill_price": entry_price,
+                "raw_pnl_pct": round(float(-sl_pct), 6),
+                "max_favorable": round(float(max_high/entry_price - 1), 6),
+                "max_adverse": round(float(min_low/entry_price - 1), 6),
+            }
+        if hit_sl:
+            return {
+                "exit_type": "sl_taker",
+                "exit_price": float(sl_price),
+                "exit_bar_idx": i,
+                "fill_bar_idx": fill_idx,
+                "fill_price": entry_price,
+                "raw_pnl_pct": round(float(-sl_pct), 6),
+                "max_favorable": round(float(max_high/entry_price - 1), 6),
+                "max_adverse": round(float(min_low/entry_price - 1), 6),
+            }
+        if hit_tp:
+            return {
+                "exit_type": "tp_maker",
+                "exit_price": float(tp_price),
+                "exit_bar_idx": i,
+                "fill_bar_idx": fill_idx,
+                "fill_price": entry_price,
+                "raw_pnl_pct": round(float(tp_pct), 6),
+                "max_favorable": round(float(max_high/entry_price - 1), 6),
+                "max_adverse": round(float(min_low/entry_price - 1), 6),
+            }
+    # Horizon exit (taker)
+    exit_price = window[-1]["c"]
+    return {
+        "exit_type": "horizon_taker",
+        "exit_price": float(exit_price),
+        "exit_bar_idx": len(window) - 1,
+        "fill_bar_idx": fill_idx,
+        "fill_price": entry_price,
+        "raw_pnl_pct": round(float(exit_price / entry_price - 1), 6),
+        "max_favorable": round(float(max_high/entry_price - 1), 6),
+        "max_adverse": round(float(min_low/entry_price - 1), 6),
+    }
+
+
 def run_paper_simulation(live_dir, rows_with_bars, pinned_rules, config,
                           progress_cb=None, sim_id=None, start_date=None,
                           end_date=None):
@@ -958,19 +1062,28 @@ def run_paper_simulation(live_dir, rows_with_bars, pinned_rules, config,
     Args:
       rows_with_bars: list of dicts; each row is a scan point with features +
         a 'future_bars' list of the next 64 bars (enough for any horizon).
-        This is NOT what build_rows_for_rule_mining outputs; the caller must
-        augment rows with future_bars. See _build_rows_with_future_bars in
-        server.py.
       pinned_rules: list of pinned rule dicts
       config: {
-        "tp_pct": 0.02,              # take-profit threshold
-        "sl_pct": 0.02,              # stop-loss threshold (set to None to disable)
-        "horizon_hours": None,       # defaults to each rule's horizon
-        "cost_bps_per_side": 30,     # 0.30% per side = 0.6% round-trip
-        "slippage_bps_per_side": 10, # additional slippage
-        "use_next_bar_open": True,   # entry at open of next bar (models lag)
-        "position_size_pct": 0.05,   # 5% of capital per trade
-        "starting_capital": 10000,   # for P&L curve
+        "tp_pct": 0.02,
+        "sl_pct": 0.02,
+        "horizon_hours": None,
+        "position_size_pct": 0.05,
+        "starting_capital": 10000,
+
+        # --- TAKER MODE (default, current behavior) ---
+        "execution_mode": "taker_market",
+        "cost_bps_per_side": 30,       # applied both entry and exit
+        "slippage_bps_per_side": 10,
+        "use_next_bar_open": True,     # entry at next bar open (execution lag)
+
+        # --- MAKER MODE (maker_limit) ---
+        # "execution_mode": "maker_limit",
+        # "maker_fee_bps": 25,          # fee on limit fills (entry always, TP exit)
+        # "taker_fee_bps": 40,          # fee on market exits (SL, horizon)
+        # "maker_slippage_bps": 2,      # tiny — limit price is known
+        # "taker_slippage_bps": 15,     # realistic for stop-outs on alts
+        # Entry price: scan_close (not next-bar open). Fill requires a future
+        # bar to trade AT OR BELOW scan_close. If the coin gaps up, no fill.
       }
       sim_id: optional identifier; auto-generated if None
       start_date/end_date: optional row date filtering
@@ -989,12 +1102,35 @@ def run_paper_simulation(live_dir, rows_with_bars, pinned_rules, config,
     tp_pct = float(config.get("tp_pct", 0.02))
     sl_pct = config.get("sl_pct")
     if sl_pct is not None: sl_pct = float(sl_pct)
-    cost_bps_side = float(config.get("cost_bps_per_side", 30))
-    slip_bps_side = float(config.get("slippage_bps_per_side", 10))
-    use_next_open = bool(config.get("use_next_bar_open", True))
     pos_size_pct = float(config.get("position_size_pct", 0.05))
     starting_capital = float(config.get("starting_capital", 10000))
-    total_cost_pct = (cost_bps_side + slip_bps_side) * 2 / 10000  # round-trip
+
+    execution_mode = config.get("execution_mode", "taker_market")
+
+    if execution_mode == "maker_limit":
+        # Asymmetric costs: maker fee + minimal slippage on limit fills;
+        # taker fee + real slippage on market exits.
+        maker_fee_bps = float(config.get("maker_fee_bps", 25))
+        taker_fee_bps = float(config.get("taker_fee_bps", 40))
+        maker_slip_bps = float(config.get("maker_slippage_bps", 2))
+        taker_slip_bps = float(config.get("taker_slippage_bps", 15))
+        # Round-trip costs differ by exit type:
+        #   tp_maker:      maker in + maker out
+        #   sl_taker:      maker in + taker out
+        #   horizon_taker: maker in + taker out
+        def exit_cost_pct(exit_type):
+            if exit_type == "tp_maker":
+                return (maker_fee_bps + maker_slip_bps) * 2 / 10000
+            else:
+                return (maker_fee_bps + maker_slip_bps + taker_fee_bps + taker_slip_bps) / 10000
+    else:
+        # Symmetric taker
+        cost_bps_side = float(config.get("cost_bps_per_side", 30))
+        slip_bps_side = float(config.get("slippage_bps_per_side", 10))
+        def exit_cost_pct(exit_type):
+            return (cost_bps_side + slip_bps_side) * 2 / 10000
+        use_next_open = bool(config.get("use_next_bar_open", True))
+        total_cost_pct = (cost_bps_side + slip_bps_side) * 2 / 10000  # round-trip
 
     # Filter by date
     if start_date or end_date:
@@ -1073,18 +1209,34 @@ def run_paper_simulation(live_dir, rows_with_bars, pinned_rules, config,
         # Simulate each fire
         fire_idx = np.where(fire_mask)[0]
         trades = []
+        n_no_fill = 0   # for maker mode: count of missed limits
         for idx in fire_idx:
             bars = future_bars_arr[idx]
-            entry_price = (row_entry_price_arr[idx] if use_next_open
-                            else row_scan_close_arr[idx])
-            if entry_price is None or entry_price <= 0 or len(bars) < horizon_bars:
-                # Skip — insufficient future data (end of dataset)
+            if len(bars) < horizon_bars:
                 continue
-            sim = simulate_trade(entry_price, bars, tp_pct,
-                                   sl_pct if sl_pct is not None else 1.0,
-                                   horizon_bars)
-            if sim is None: continue
-            net_pnl_pct = sim["raw_pnl_pct"] - total_cost_pct
+
+            if execution_mode == "maker_limit":
+                # Entry at scan close — post limit there, wait for fill
+                limit_price = row_scan_close_arr[idx]
+                if limit_price is None or limit_price <= 0: continue
+                sim = simulate_trade_maker(limit_price, bars, tp_pct,
+                                            sl_pct if sl_pct is not None else 1.0,
+                                            horizon_bars)
+                if sim is None:
+                    n_no_fill += 1
+                    continue
+                net_pnl_pct = sim["raw_pnl_pct"] - exit_cost_pct(sim["exit_type"])
+                entry_price = sim["fill_price"]
+            else:
+                entry_price = (row_entry_price_arr[idx] if use_next_open
+                                else row_scan_close_arr[idx])
+                if entry_price is None or entry_price <= 0: continue
+                sim = simulate_trade(entry_price, bars, tp_pct,
+                                       sl_pct if sl_pct is not None else 1.0,
+                                       horizon_bars)
+                if sim is None: continue
+                net_pnl_pct = sim["raw_pnl_pct"] - total_cost_pct
+
             trades.append({
                 "date": df.iloc[idx].get("date"),
                 "scan_hour": int(df.iloc[idx].get("scan_hour", 0)),
@@ -1104,7 +1256,7 @@ def run_paper_simulation(live_dir, rows_with_bars, pinned_rules, config,
 
         # Aggregates
         if not trades:
-            agg = {"n_trades": 0}
+            agg = {"n_trades": 0, "n_no_fill": n_no_fill if execution_mode == "maker_limit" else 0}
         else:
             pnls = [t["net_pnl_pct"] for t in trades]
             raw_pnls = [t["raw_pnl_pct"] for t in trades]
@@ -1125,11 +1277,20 @@ def run_paper_simulation(live_dir, rows_with_bars, pinned_rules, config,
                         "win_rate": round(sum(1 for x in sp if x > 0)/len(sp), 4),
                         "total_net_pct": round(sum(sp), 4),
                     }
+            # In maker mode, "cost_bps_per_trade" is mixed across exit types.
+            # Report the MEAN cost charged across trades.
+            if execution_mode == "maker_limit":
+                costs = [exit_cost_pct(t["exit_type"]) * 10000 for t in trades]
+                mean_cost_bps = round(sum(costs) / len(costs), 1)
+            else:
+                mean_cost_bps = round(total_cost_pct * 10000, 1)
             agg = {
                 "n_trades": n,
+                "n_no_fill": n_no_fill if execution_mode == "maker_limit" else 0,
+                "fill_rate": round(n / (n + n_no_fill), 4) if (n + n_no_fill) > 0 else None,
                 "mean_net_pnl_pct": round(mean_net, 6),
                 "mean_raw_pnl_pct": round(mean_raw, 6),
-                "cost_bps_per_trade": round(total_cost_pct * 10000, 1),
+                "cost_bps_per_trade": mean_cost_bps,
                 "win_rate_net": round(wins / n, 4),
                 "total_net_pct": round(sum(pnls), 4),
                 "best_trade_pct": round(max(pnls), 4),

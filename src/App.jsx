@@ -2293,11 +2293,18 @@ function BacktestPanel({ pinned }) {
 // This is the "does this actually make money after frictions" check.
 
 function PaperSimPanel({ pinned }) {
+  const [executionMode, setExecutionMode] = useState("taker_market");   // or "maker_limit"
   const [tpPct, setTpPct] = useState(2.0);
   const [slPct, setSlPct] = useState(2.0);
+  // Taker-mode fee fields
   const [costBps, setCostBps] = useState(30);
   const [slipBps, setSlipBps] = useState(10);
   const [useNextOpen, setUseNextOpen] = useState(true);
+  // Maker-mode fee fields
+  const [makerFeeBps, setMakerFeeBps] = useState(25);
+  const [takerFeeBps, setTakerFeeBps] = useState(40);
+  const [makerSlipBps, setMakerSlipBps] = useState(2);
+  const [takerSlipBps, setTakerSlipBps] = useState(15);
   const [posPct, setPosPct] = useState(5.0);
   const [capital, setCapital] = useState(10000);
   const [startDate, setStartDate] = useState("");
@@ -2336,10 +2343,19 @@ function PaperSimPanel({ pinned }) {
     setError(null);
     const body = {
       tp_pct: tpPct / 100, sl_pct: slPct / 100,
-      cost_bps_per_side: costBps, slippage_bps_per_side: slipBps,
-      use_next_bar_open: useNextOpen,
       position_size_pct: posPct / 100, starting_capital: capital,
+      execution_mode: executionMode,
     };
+    if (executionMode === "maker_limit") {
+      body.maker_fee_bps = makerFeeBps;
+      body.taker_fee_bps = takerFeeBps;
+      body.maker_slippage_bps = makerSlipBps;
+      body.taker_slippage_bps = takerSlipBps;
+    } else {
+      body.cost_bps_per_side = costBps;
+      body.slippage_bps_per_side = slipBps;
+      body.use_next_bar_open = useNextOpen;
+    }
     if (startDate) body.start_date = startDate;
     if (endDate) body.end_date = endDate;
     try {
@@ -2364,11 +2380,35 @@ function PaperSimPanel({ pinned }) {
       <div style={{marginBottom:12}}>
         <Lbl>💵 Paper Trading Simulation</Lbl>
         <div style={{fontSize:11,color:"#94a3b8",marginTop:6,lineHeight:1.6}}>
-          Replays every rule fire as a paper trade with realistic exits (TP/SL),
-          trading costs (Coinbase taker fees), slippage, and execution lag (next-bar-open entry).
+          Replays every rule fire as a paper trade with realistic exits (TP/SL) and trading costs.
           This is the honest "does this make money" check — precision alone isn't enough.
-          Defaults: +2%/-2% TP/SL, 30 bps per-side cost, 10 bps slippage (0.8% round-trip), 5% size per trade.
+          Choose between <b>taker</b> (market orders, models execution lag) or <b>maker</b> (limit orders,
+          lower fees but some fires won't fill).
         </div>
+      </div>
+
+      {/* Execution mode selector */}
+      <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:8,padding:"8px 10px",
+        background:"rgba(59,130,246,0.06)",border:"1px solid rgba(59,130,246,0.2)",borderRadius:4}}>
+        <span style={{fontSize:11,color:"#93c5fd",fontWeight:600}}>Execution mode:</span>
+        <label style={{fontSize:11,color:"#e2e8f0",cursor:"pointer"}}>
+          <input type="radio" name="exec_mode" checked={executionMode === "taker_market"}
+            onChange={() => setExecutionMode("taker_market")}
+            style={{marginRight:4}}/>
+          Taker (market orders)
+        </label>
+        <label style={{fontSize:11,color:"#e2e8f0",cursor:"pointer"}}>
+          <input type="radio" name="exec_mode" checked={executionMode === "maker_limit"}
+            onChange={() => setExecutionMode("maker_limit")}
+            style={{marginRight:4}}/>
+          Maker (limit orders; limits may not fill)
+        </label>
+        <span style={{flex:1}}/>
+        <span style={{fontSize:9,color:"#64748b"}}>
+          {executionMode === "maker_limit"
+            ? "Entry: limit at scan close (filled if price dips). Exit: TP=limit (maker), SL/horizon=market (taker)."
+            : "Entry: market at next bar open (models execution lag). All exits: market."}
+        </span>
       </div>
 
       {/* Config */}
@@ -2387,18 +2427,46 @@ function PaperSimPanel({ pinned }) {
             style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
               border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
         </div>
-        <div>
-          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Cost bps (per side)</div>
-          <input type="number" value={costBps} onChange={e => setCostBps(parseFloat(e.target.value) || 0)}
-            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
-              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
-        </div>
-        <div>
-          <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Slippage bps</div>
-          <input type="number" value={slipBps} onChange={e => setSlipBps(parseFloat(e.target.value) || 0)}
-            style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
-              border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
-        </div>
+        {executionMode === "taker_market" && (<>
+          <div>
+            <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Cost bps per side</div>
+            <input type="number" value={costBps} onChange={e => setCostBps(parseFloat(e.target.value) || 0)}
+              style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+                border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+          </div>
+          <div>
+            <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Slippage bps</div>
+            <input type="number" value={slipBps} onChange={e => setSlipBps(parseFloat(e.target.value) || 0)}
+              style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+                border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+          </div>
+        </>)}
+        {executionMode === "maker_limit" && (<>
+          <div>
+            <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Maker fee bps</div>
+            <input type="number" value={makerFeeBps} onChange={e => setMakerFeeBps(parseFloat(e.target.value) || 0)}
+              style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+                border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+          </div>
+          <div>
+            <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Taker fee bps (SL exits)</div>
+            <input type="number" value={takerFeeBps} onChange={e => setTakerFeeBps(parseFloat(e.target.value) || 0)}
+              style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+                border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+          </div>
+          <div>
+            <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Maker slip bps</div>
+            <input type="number" value={makerSlipBps} onChange={e => setMakerSlipBps(parseFloat(e.target.value) || 0)}
+              style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+                border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+          </div>
+          <div>
+            <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Taker slip bps</div>
+            <input type="number" value={takerSlipBps} onChange={e => setTakerSlipBps(parseFloat(e.target.value) || 0)}
+              style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
+                border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
+          </div>
+        </>)}
         <div>
           <div style={{fontSize:9,color:"#64748b",marginBottom:3}}>Position size %</div>
           <input type="number" step="0.5" value={posPct} onChange={e => setPosPct(parseFloat(e.target.value) || 0)}
@@ -2411,13 +2479,15 @@ function PaperSimPanel({ pinned }) {
             style={{width:"100%",padding:"4px 6px",fontSize:11,background:"#0c0f14",color:"#e2e8f0",
               border:"1px solid rgba(255,255,255,0.1)",borderRadius:3}} />
         </div>
-        <div style={{display:"flex",alignItems:"flex-end"}}>
-          <label style={{fontSize:10,color:"#94a3b8",cursor:"pointer",userSelect:"none"}}>
-            <input type="checkbox" checked={useNextOpen} onChange={e => setUseNextOpen(e.target.checked)}
-              style={{marginRight:6}}/>
-            Entry at next-bar open (model exec lag)
-          </label>
-        </div>
+        {executionMode === "taker_market" && (
+          <div style={{display:"flex",alignItems:"flex-end"}}>
+            <label style={{fontSize:10,color:"#94a3b8",cursor:"pointer",userSelect:"none"}}>
+              <input type="checkbox" checked={useNextOpen} onChange={e => setUseNextOpen(e.target.checked)}
+                style={{marginRight:6}}/>
+              Entry at next-bar open (model exec lag)
+            </label>
+          </div>
+        )}
       </div>
 
       <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
@@ -2516,7 +2586,7 @@ function PaperSimPanel({ pinned }) {
               <thead>
                 <tr style={{borderBottom:"1px solid rgba(255,255,255,0.08)"}}>
                   <th style={{padding:"6px 8px",textAlign:"left",color:"#64748b",fontSize:10,fontWeight:500}}>Rule</th>
-                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Trades</th>
+                  <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="For maker mode: filled / (filled + no-fill)">Trades</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="Mean P&L per trade before costs">Raw/trade</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}} title="Mean P&L per trade after costs">Net/trade</th>
                   <th style={{padding:"6px 8px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>Win rate</th>
@@ -2529,6 +2599,7 @@ function PaperSimPanel({ pinned }) {
                 {rules.sort((a,b) => (b.aggregate?.total_net_pct || 0) - (a.aggregate?.total_net_pct || 0)).map(r => {
                   const agg = r.aggregate || {};
                   const ts = agg.by_split?.test || {};
+                  const isMaker = (selectedReport?.config?.execution_mode === "maker_limit");
                   return (
                     <tr key={r.pin_id} style={{borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
                       <td style={{padding:"4px 6px",maxWidth:330}}>
@@ -2539,7 +2610,9 @@ function PaperSimPanel({ pinned }) {
                         <div style={{fontSize:9,color:"#475569",fontFamily:F}}>{r.pin_id.slice(0,30)}</div>
                       </td>
                       <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:"#94a3b8"}}>
-                        {agg.n_trades ?? 0}
+                        {isMaker && agg.n_no_fill > 0
+                          ? `${agg.n_trades ?? 0}/${(agg.n_trades ?? 0) + (agg.n_no_fill ?? 0)}`
+                          : (agg.n_trades ?? 0)}
                       </td>
                       <td style={{padding:"4px 6px",textAlign:"right",fontVariantNumeric:"tabular-nums",color:pnlColor(agg.mean_raw_pnl_pct)}}>
                         {agg.mean_raw_pnl_pct != null ? `${(agg.mean_raw_pnl_pct*100).toFixed(2)}%` : "—"}
