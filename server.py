@@ -2654,6 +2654,57 @@ def v2_live_paper_sim_load(sim_id: str):
     if r is None: return JSONResponse({"error": "not found"}, 404)
     return r
 
+# ═══════════════════════════════════════════════════════════════════
+# DATA EXPORT — CSV presets for offline analysis
+# ═══════════════════════════════════════════════════════════════════
+import data_export as data_export_module
+from fastapi.responses import Response as _Response
+
+@app.get("/api/data_export/presets")
+def list_data_export_presets():
+    """List available export presets with descriptions."""
+    return {
+        "presets": [
+            {"name": name, "description": desc}
+            for name, desc in data_export_module.PRESET_DESCRIPTIONS.items()
+        ]
+    }
+
+@app.get("/api/data_export/{preset_name}")
+def download_data_export(preset_name: str):
+    """
+    Build and stream a ZIP for the given preset. Uses cached bars.
+
+    Preset names: daily_overview, hourly_features, event_windows,
+    time_of_day, rolling_correlations
+    """
+    if preset_name not in data_export_module.PRESET_REGISTRY:
+        return JSONResponse(
+            {"error": f"unknown preset '{preset_name}'. Valid: {list(data_export_module.PRESET_REGISTRY.keys())}"}, 404)
+
+    if not BARS_INTRADAY_CACHE.exists():
+        return JSONResponse({"error": "no cached bars on disk"}, 500)
+
+    try:
+        intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+        log.info(f"data_export {preset_name}: building from {len(intraday)} coins")
+        build_fn = data_export_module.PRESET_REGISTRY[preset_name]
+        files = build_fn(intraday, PRODUCTS, CATEGORIES, BENCHMARK)
+        zip_bytes = data_export_module.build_preset_zip(preset_name, files)
+        fname = f"coinbase_export_{preset_name}_{today_utc()}.zip"
+        return _Response(
+            content=zip_bytes,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+    except Exception as e:
+        log.exception(f"data_export {preset_name} failed: {e}")
+        import traceback
+        return JSONResponse({
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }, 500)
+
 # SPA fallback
 dist_path = Path(__file__).parent / "dist"
 if dist_path.exists():

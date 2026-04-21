@@ -2656,6 +2656,156 @@ function PaperSimPanel({ pinned }) {
   );
 }
 
+// ─── DATA EXPORT TAB ─────────────────────────────────────────────
+// Downloads analytical CSV presets for offline Claude analysis.
+// Each preset is a focused slice: daily overview, hourly features,
+// event windows, time-of-day, or rolling correlations.
+
+function DataExportTab() {
+  const [presets, setPresets] = useState([]);
+  const [downloading, setDownloading] = useState(null);   // preset name currently downloading
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    fetch('/api/data_export/presets').then(r => r.json())
+      .then(d => setPresets(d.presets || []))
+      .catch(e => setError(e.message));
+  }, []);
+
+  const downloadPreset = async (name) => {
+    setDownloading(name); setError(null);
+    try {
+      const r = await fetch(`/api/data_export/${name}`);
+      if (!r.ok) {
+        const d = await r.json();
+        throw new Error(d.error || `HTTP ${r.status}`);
+      }
+      const blob = await r.blob();
+      const fname = r.headers.get('content-disposition')?.match(/filename="(.+)"/)?.[1]
+        || `coinbase_export_${name}.zip`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = fname;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a); URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(`${name}: ${e.message}`);
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  // Map preset → guidance so users know which to upload for which question
+  const guidance = {
+    daily_overview: {
+      startHere: true,
+      bestFor: "Broad orientation. Which coins have the highest returns/volatility? Which pairs move together?",
+      claudePrompt: `Given daily_returns.csv, universe.csv, daily_correlations.csv from my Coinbase scanner: what stands out? Look for outliers, unexpected correlations, and any patterns worth investigating further with a more targeted preset.`,
+    },
+    hourly_features: {
+      bestFor: "Lead/lag analysis. Does coin A consistently move before coin B at 6h cadence?",
+      claudePrompt: `Given hourly_features.csv (6-hour snapshots per coin with returns, RSI, volume_z, vs_BTC): compute cross-correlation of coin returns at different lags to identify lead/lag relationships. Which coins lead BTC? Which ones lag by 1-2 slots?`,
+    },
+    event_windows: {
+      bestFor: "Pre-event signatures. What features are elevated/suppressed in the 6 hours BEFORE a +5% move?",
+      claudePrompt: `Given events.csv and event_features.csv (windows around +5% moves): look at the bars with offset_bars < 0 (pre-event) and identify what features (volume, cumulative return, BTC return) are systematically different from a random baseline. Do big moves pre-announce themselves?`,
+    },
+    time_of_day: {
+      bestFor: "Calendar effects. Are certain hours of UTC day systematically bullish/bearish?",
+      claudePrompt: `Given hour_of_day_stats.csv and day_of_week_stats.csv: are there statistically meaningful time-of-day or day-of-week effects? Calculate standard errors and identify coins with the most pronounced patterns.`,
+    },
+    rolling_correlations: {
+      bestFor: "Regime analysis. When did coins decouple from BTC? How do correlations shift during high-vol periods?",
+      claudePrompt: `Given rolling_corr_btc.csv and volatility_regimes.csv: identify coins whose correlation to BTC varies most dramatically. Are correlations higher during high-vol regimes? Which coins are most independent?`,
+    },
+  };
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:12}}>
+      <Box>
+        <div style={{fontSize:11,color:"#06b6d4",letterSpacing:0.5,textTransform:"uppercase",marginBottom:6,fontWeight:700}}>
+          Data Export — analytical CSV presets
+        </div>
+        <div style={{fontSize:12,color:"#94a3b8",lineHeight:1.6}}>
+          Export pre-analyzed slices of the cached Coinbase market data for offline analysis.
+          Each preset downloads as a ZIP with 1-3 CSVs + a self-describing README.
+          Upload one to a fresh Claude conversation with the suggested prompt to investigate
+          that specific question. Iterate by downloading different presets as findings suggest.
+        </div>
+      </Box>
+
+      {error && (
+        <Box>
+          <div style={{padding:"8px 12px",borderRadius:4,background:"rgba(239,68,68,0.1)",
+            border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:12}}>
+            {error}
+          </div>
+        </Box>
+      )}
+
+      {presets.length === 0 && !error && (
+        <Box><div style={{color:"#475569",fontSize:12}}>Loading presets...</div></Box>
+      )}
+
+      {presets.map(preset => {
+        const g = guidance[preset.name] || {};
+        return (
+          <Box key={preset.name}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,flexWrap:"wrap"}}>
+              <div style={{flex:"1 1 400px"}}>
+                <div style={{fontSize:13,color:"#e2e8f0",fontWeight:700,marginBottom:4}}>
+                  {g.startHere && <span style={{color:"#22c55e",fontSize:10,marginRight:6,
+                    padding:"2px 6px",background:"rgba(34,197,94,0.15)",borderRadius:3}}>START HERE</span>}
+                  {preset.name}
+                </div>
+                <div style={{fontSize:11,color:"#94a3b8",marginBottom:6}}>
+                  {preset.description}
+                </div>
+                {g.bestFor && (
+                  <div style={{fontSize:11,color:"#cbd5e1",marginBottom:8,lineHeight:1.5}}>
+                    <span style={{color:"#64748b",fontSize:10,textTransform:"uppercase"}}>Best for: </span>
+                    {g.bestFor}
+                  </div>
+                )}
+                {g.claudePrompt && (
+                  <div style={{fontSize:10,color:"#64748b",marginTop:6,marginBottom:2,textTransform:"uppercase",letterSpacing:0.5}}>
+                    Suggested prompt for a fresh Claude conversation:
+                  </div>
+                )}
+                {g.claudePrompt && (
+                  <div style={{fontSize:10,padding:"6px 8px",background:"rgba(6,182,212,0.06)",
+                    border:"1px solid rgba(6,182,212,0.15)",borderRadius:3,
+                    color:"#a5f3fc",fontFamily:F,lineHeight:1.5}}>
+                    {g.claudePrompt}
+                  </div>
+                )}
+              </div>
+              <div>
+                <Btn onClick={() => downloadPreset(preset.name)}
+                  disabled={downloading !== null}
+                  color="#06b6d4" style={{padding:"6px 14px",fontSize:11,fontWeight:700,whiteSpace:"nowrap"}}>
+                  {downloading === preset.name ? "Building..." : "⬇ Download ZIP"}
+                </Btn>
+              </div>
+            </div>
+          </Box>);
+      })}
+
+      <Box>
+        <div style={{fontSize:10,color:"#475569",lineHeight:1.6}}>
+          <b style={{color:"#94a3b8"}}>Workflow:</b> Open a new Claude conversation, upload the ZIP,
+          paste the suggested prompt. If a finding looks promising, come back here and download another
+          preset to drill down. Each preset is independent; you don't need to keep any project context.
+          <br/><br/>
+          <b style={{color:"#94a3b8"}}>Why separate downloads?</b> Each ZIP is sized for Claude's context
+          window (~1-10MB). Uploading everything at once slows analysis. One focused upload per question
+          gives cleaner results.
+        </div>
+      </Box>
+    </div>
+  );
+}
+
 // ─── MAIN ────────────────────────────────────────────────────────
 export default function CoinbaseScanner() {
   const [scanHour,setScanHour]=useState(12);
@@ -2699,7 +2849,7 @@ export default function CoinbaseScanner() {
     }catch(e){alert(e.message);}
   },[]);
 
-  const tabs=[{id:"live",l:"Live (v2.3)",c:"#22c55e"},{id:"rules",l:"Rules (v2.2)",c:"#8b5cf6"},{id:"v2",l:"v2 Classifier"},{id:"scanner",l:"Scanner (v1)"},{id:"training",l:"Training (v1)",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes (v1)",c:"#22c55e"},{id:"status",l:"Status"}];
+  const tabs=[{id:"live",l:"Live (v2.3)",c:"#22c55e"},{id:"rules",l:"Rules (v2.2)",c:"#8b5cf6"},{id:"export",l:"Data Export",c:"#06b6d4"},{id:"v2",l:"v2 Classifier"},{id:"scanner",l:"Scanner (v1)"},{id:"training",l:"Training (v1)",c:"#8b5cf6"},{id:"outcomes",l:"Outcomes (v1)",c:"#22c55e"},{id:"status",l:"Status"}];
 
   return (
     <div style={{fontFamily:F,background:"#0c0f14",color:"#e2e8f0",minHeight:"100vh"}}>
@@ -2712,10 +2862,11 @@ export default function CoinbaseScanner() {
           <span style={{color:"#eab308",fontWeight:600}}>
             {tab==="live" ? "v2 Stage 3 — Live scanner + outcome recording" :
               tab==="rules" ? "v2 Stage 2 — Rule mining (absolute +%, multi-horizon)" :
+              tab==="export" ? "Data Export — analytical CSV presets for offline analysis" :
               tab==="v2" ? "v2 — Vol-normalized threshold classifier (Stage 1)" :
               health ? `TP +${health.tp_pct}% / SL -${health.sl_pct}% / ${health.horizonHours||4}h horizon (BE ${health.breakeven}%)` : "Loading..."}
           </span>
-          {lastUpdate&&tab!=="v2"&&tab!=="rules"&&tab!=="live"&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
+          {lastUpdate&&tab!=="v2"&&tab!=="rules"&&tab!=="live"&&tab!=="export"&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
         </div>
       </div>
 
@@ -2736,6 +2887,7 @@ export default function CoinbaseScanner() {
       <div style={{padding:"16px 20px"}}>
         {tab==="live"&&<LiveTab/>}
         {tab==="rules"&&<RulesTab/>}
+        {tab==="export"&&<DataExportTab/>}
         {tab==="v2"&&<V2Tab/>}
         {tab==="scanner"&&<ScannerTab data={data} scanHour={scanHour} source={source} elapsed={elapsed} message={message} modelWR10={modelWR10} modelPnL10={modelPnL10} health={health} scanInfo={scanInfo}/>}
         {tab==="training"&&<TrainingTab/>}
