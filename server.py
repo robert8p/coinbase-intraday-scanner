@@ -2338,6 +2338,73 @@ def v2_live_unpin(pin_id: str):
 def v2_live_list_pinned():
     return {"rules": v2_live_module.load_pinned_rules(V2_LIVE_DIR)}
 
+class V2PinCustomRequest(BaseModel):
+    pin_id: str           # unique identifier
+    english: str          # human-readable description
+    # Conditions as list of {feature, op, threshold} where op ∈ {"lt", "gt"}
+    # Translated to bin format internally.
+    conditions: list
+    threshold_pct: float  # outcome threshold (e.g. 0.02 = +2%)
+    horizon_hours: int
+    validation_precision: float = None  # from OOS test if available
+    validation_support: int = None
+    validation_base_rate: float = None
+    notes: str = None
+
+@app.post("/api/v2/live/pin_custom")
+def v2_live_pin_custom(req: V2PinCustomRequest):
+    """
+    Pin a custom threshold-based rule (not from a catalog).
+    Each condition: {"feature": str, "op": "lt"|"gt", "threshold": float}
+    Translated to bin/edge format: edges=[threshold], bin=0 for lt, bin=1 for gt.
+    """
+    converted_conditions = []
+    bin_edges = {}
+    for c in req.conditions:
+        feat = c["feature"]; op = c["op"]; t = float(c["threshold"])
+        if op == "lt":
+            # v < t → bin 0
+            converted_conditions.append({"feature": feat, "bins": [0]})
+        elif op == "gt":
+            # v >= t → bin 1 (len(edges))
+            converted_conditions.append({"feature": feat, "bins": [1]})
+        else:
+            return JSONResponse({"error": f"unknown op {op}, must be lt or gt"}, 400)
+        # Multiple conditions on the same feature: merge edges carefully
+        if feat in bin_edges:
+            existing = bin_edges[feat]
+            # Only handle single-edge-per-feature case for custom rules
+            if existing != [t]:
+                return JSONResponse({"error": f"multiple thresholds on {feat} not supported"}, 400)
+        bin_edges[feat] = [t]
+
+    pinned = {
+        "pin_id": req.pin_id,
+        "rule_id": req.pin_id,  # custom rules are self-identifying
+        "english": req.english,
+        "conditions": converted_conditions,
+        "bin_edges": bin_edges,
+        "bin_labels": {},
+        "threshold_pct": req.threshold_pct,
+        "horizon_hours": req.horizon_hours,
+        "validation_precision": req.validation_precision,
+        "validation_support": req.validation_support,
+        "validation_base_rate": req.validation_base_rate,
+        "source_catalog": {
+            "threshold_bps": int(round(req.threshold_pct * 10000)),
+            "horizon_hours": req.horizon_hours,
+            "type": "custom",
+        },
+        "disqualifier": None,
+        "notes": req.notes,
+        "pinned_at": datetime.now(UTC).isoformat(),
+    }
+    current = v2_live_module.load_pinned_rules(V2_LIVE_DIR)
+    current = [r for r in current if r["pin_id"] != pinned["pin_id"]]
+    current.append(pinned)
+    v2_live_module.save_pinned_rules(V2_LIVE_DIR, current)
+    return {"status": "pinned", "pin_id": pinned["pin_id"], "rule": pinned}
+
 @app.post("/api/v2/live/scan")
 def v2_live_scan_now(bg: BackgroundTasks):
     """Trigger a live scan manually. Runs in the background."""

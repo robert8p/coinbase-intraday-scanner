@@ -840,6 +840,8 @@ PRESET_REGISTRY = {
     "event_windows": build_event_windows,
     "time_of_day": build_time_of_day,
     "rolling_correlations": build_rolling_correlations,
+    "capitulation_paths": lambda intraday, products, categories, benchmark:
+        build_capitulation_paths(intraday, products, categories, benchmark),
 }
 
 PRESET_DESCRIPTIONS = {
@@ -848,4 +850,138 @@ PRESET_DESCRIPTIONS = {
     "event_windows": "Pre/post windows for all ≥5% moves (top 500 events, ≈3-5MB)",
     "time_of_day": "Per-coin hour-of-day and day-of-week return aggregates (≈1MB)",
     "rolling_correlations": "30-day rolling correlation to BTC + BTC volatility regime labels (≈1-2MB)",
+    "capitulation_paths": "15-min price paths for every 6h drop ≥10% setup — for intra-horizon TP/SL simulation (≈2-4MB)",
 }
+
+
+def build_capitulation_paths(intraday_bars, products, categories, benchmark):
+    """
+    Export preset for intra-horizon P&L simulation of the capitulation-bounce rule.
+
+    Finds every setup where a coin's 6h return (trailing 24 × 15min bars) ≤ -10%,
+    then exports the post-setup bars for 12h (48 × 15min bars).
+
+    Output:
+      setups.csv: one row per setup:
+        setup_id, coin, category, setup_time, setup_price (entry),
+        ret_6h_pct (actual value), date
+      paths.csv: one row per (setup_id, bar_offset):
+        setup_id, bar_offset (1-48 = minutes 15..720 after entry),
+        timestamp, open, high, low, close, volume
+    """
+    setups = []
+    setup_id = 0
+
+    for coin in products:
+        bars = sorted(intraday_bars.get(coin, []), key=lambda b: b["t"])
+        if len(bars) < 80: continue
+
+        # Walk bars looking for 6h drops
+        # Use non-overlapping setups: once one fires, skip 48 bars ahead
+        i = 24  # need 24 bars of history for 6h return
+        while i < len(bars) - 48:
+            close_now = bars[i]["c"]
+            close_6h_ago = bars[i - 24]["c"]
+            if close_6h_ago <= 0 or close_now <= 0:
+                i += 1; continue
+            ret_6h = (close_now / close_6h_ago - 1) * 100
+            if ret_6h < -10:
+                # This is a setup. Record it and the next 48 bars of path.
+                setup_id += 1
+                setups.append({
+                    "setup_id": setup_id,
+                    "coin": coin,
+                    "category": categories.get(coin, "?"),
+                    "setup_time": bars[i]["t"],
+                    "date": bars[i]["t"][:10],
+                    "setup_price": close_now,
+                    "ret_6h_pct": ret_6h,
+                    "_bar_idx": i,   # internal: strip before export
+                })
+                i += 48  # skip 12h forward, non-overlapping
+            else:
+                i += 1
+
+    # Build paths.csv rows
+    path_rows = []
+    for s in setups:
+        bars = sorted(intraday_bars.get(s["coin"], []), key=lambda b: b["t"])
+        start_idx = s["_bar_idx"]
+        entry = s["setup_price"]
+        for offset in range(1, 49):   # bars 1..48 = next 12h
+            idx = start_idx + offset
+            if idx >= len(bars): break
+            b = bars[idx]
+            path_rows.append({
+                "setup_id": s["setup_id"],
+                "bar_offset": offset,
+                "timestamp": b["t"],
+                "open": b["o"],
+                "high": b["h"],
+                "low": b["l"],
+                "close": b["c"],
+                "volume": b["v"],
+                # Precomputed cumulative % from entry
+                "close_vs_entry_pct": round((b["c"]/entry - 1) * 100, 4) if entry > 0 else None,
+                "high_vs_entry_pct":  round((b["h"]/entry - 1) * 100, 4) if entry > 0 else None,
+                "low_vs_entry_pct":   round((b["l"]/entry - 1) * 100, 4) if entry > 0 else None,
+            })
+
+    # Strip internal fields
+    for s in setups: s.pop("_bar_idx", None)
+
+    readme = f"""# Preset F — Capitulation-Bounce Setup Paths
+
+Generated: {datetime.now(UTC).isoformat()}
+Setups captured: {len(setups)}
+Total path bars: {len(path_rows)}
+
+## Files
+
+### setups.csv
+One row per capitulation-bounce setup. A setup is any bar where the coin's
+trailing 6h return (24 × 15min bars) is ≤ -10%. Non-overlapping: once a setup
+fires, the next 12h on that coin are skipped.
+
+Columns:
+- setup_id (1..N)
+- coin, category
+- setup_time (UTC timestamp when setup fires)
+- date (YYYY-MM-DD)
+- setup_price (bar close price at setup time = entry price)
+- ret_6h_pct (actual 6h return — always ≤ -10 by definition of setup)
+
+### paths.csv
+15-minute price path for each setup's following 12 hours (48 bars).
+
+Columns:
+- setup_id
+- bar_offset (1..48 = minutes 15 to 720 after entry)
+- timestamp (UTC)
+- open, high, low, close, volume (raw OHLCV)
+- close_vs_entry_pct, high_vs_entry_pct, low_vs_entry_pct
+  (cumulative % change from entry_price — precomputed for convenience)
+
+## Intended analysis
+
+Simulate TP/SL exit strategies with realistic intra-bar granularity:
+  For each setup, walk through bars 1..48. Exit at first bar where:
+    - high_vs_entry_pct ≥ TP_threshold (TP triggered at TP price)
+    - low_vs_entry_pct ≤ -SL_threshold (SL triggered at SL price)
+  If neither triggers, exit at bar 48 close (horizon).
+
+The hourly_features preset can only do close-to-close checks at 6h intervals;
+this preset gives true intra-bar simulation.
+
+## Questions this preset answers
+
+- Does TP+3%/SL-2% recover more EV than close-to-close simulation suggests?
+- What fraction of "no-stop" winners would have hit TP early?
+- What fraction of "no-stop" losers would have hit SL early?
+- Is there an optimal TP/SL combo we missed at lower granularity?
+"""
+    return {
+        "setups.csv": _writer(setups),
+        "paths.csv": _writer(path_rows),
+        "README.md": readme,
+    }

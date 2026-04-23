@@ -389,6 +389,16 @@ def compute_features_v2(bars, daily_bars, current_price, open_price, scan_hour,
     ret_6b_atr  = _norm_ret(6)
     ret_12b_atr = _norm_ret(12)
 
+    # Raw percent returns (not vol-normalized) — used by threshold-based rules.
+    # These are NOT in FEATURE_NAMES_V2 so they don't affect the v2 model.
+    # They ARE included in the feature dict so pinned rules can reference them.
+    def _raw_pct_ret(n):
+        if len(closes) <= n or closes[-n-1] <= 0: return 0.0
+        return (closes[-1] / closes[-n-1] - 1) * 100
+    ret_6h_pct  = _raw_pct_ret(24)   # 24 × 15min = 6h
+    ret_12h_pct = _raw_pct_ret(48)   # 12h
+    ret_24h_pct = _raw_pct_ret(96)   # 24h (if enough bars)
+
     # VWAP features
     vn = sum((b["h"]+b["l"]+b["c"])/3 * b["v"] for b in bars)
     vd = sum(vols)
@@ -633,6 +643,10 @@ def compute_features_v2(bars, daily_bars, current_price, open_price, scan_hour,
         "rank_range_position":rank_range_position,
         # G
         "scan_hour_sin":scan_hour_sin,"scan_hour_cos":scan_hour_cos,
+        # H. Raw %-return features for threshold-based rule mining (NOT in FEATURE_NAMES_V2,
+        # so v2 classifier won't see them; only pinned rules that explicitly reference
+        # them will use them).
+        "ret_6h_pct":ret_6h_pct,"ret_12h_pct":ret_12h_pct,"ret_24h_pct":ret_24h_pct,
     }
 
 def add_cross_sectional_features_v2(features_list, cat_list, dollar_vol_list):

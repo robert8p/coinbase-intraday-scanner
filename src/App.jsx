@@ -1839,6 +1839,48 @@ function LiveTab() {
           </div>
         )}
 
+        {/* Pin capitulation-bounce (from brute-force mining, OOS test +4.83%) */}
+        <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",marginBottom:10,
+          background:"rgba(168,85,247,0.06)",border:"1px solid rgba(168,85,247,0.15)",borderRadius:4}}>
+          <span style={{fontSize:11,color:"#a855f7"}}>⚡ Quick action:</span>
+          <span style={{fontSize:11,color:"#94a3b8"}}>
+            Pin the capitulation-bounce rule (6h drop ≥ 10% → +2% in 12h).
+            Test precision 57.8%, OOS +4.83% on 65 trades.
+          </span>
+          <span style={{flex:1}}/>
+          <Btn onClick={async () => {
+            if (!confirm(`Pin the capitulation-bounce rule?\n\n`
+              + `Rule: ret_6h_pct < -10% → +2% within 12h\n`
+              + `Test precision: 57.8% (vs 20.6% base rate)\n`
+              + `Test EV: +4.83% over 87 days (65 trades), annualized +21.9%\n\n`
+              + `Note: Val slice showed -2.34% during Oct 2025 crash period.\n`
+              + `This rule has real regime risk; pinning lets us collect forward data.`)) return;
+            try {
+              const r = await fetch('/api/v2/live/pin_custom', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  pin_id: "capitulation_bounce_6h_12h",
+                  english: "ret_6h_pct < -10% → +2% within 12h",
+                  conditions: [
+                    {"feature": "ret_6h_pct", "op": "lt", "threshold": -10.0},
+                  ],
+                  threshold_pct: 0.02,
+                  horizon_hours: 12,
+                  validation_precision: 0.578,
+                  validation_support: 65,
+                  validation_base_rate: 0.206,
+                  notes: "From brute-force mining on 360d (train/val/test temporal split). Test EV +4.83%, annualized +21.9%. Val -2.34% during crash regime. Mined 2026-04-23.",
+                }),
+              });
+              const d = await r.json();
+              if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+              alert(`Pinned.\n\npin_id: ${d.pin_id}\n\nThe live scanner will now evaluate this rule on every scan and record outcomes.`);
+            } catch (e) { alert(e.message); }
+          }} color="#a855f7" style={{padding:"4px 10px",fontSize:10,fontWeight:700}}>
+            📌 Pin capitulation-bounce rule
+          </Btn>
+        </div>
+
         {pinned.length === 0 ? (
           <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
             No pinned rules. Go to the <span style={{color:"#8b5cf6",fontWeight:600}}>Rules tab</span>,
