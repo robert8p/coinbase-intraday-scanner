@@ -2671,27 +2671,36 @@ def list_data_export_presets():
     }
 
 @app.get("/api/data_export/{preset_name}")
-def download_data_export(preset_name: str):
+def download_data_export(preset_name: str, window: str = "current"):
     """
     Build and stream a ZIP for the given preset. Uses cached bars.
 
     Preset names: daily_overview, hourly_features, event_windows,
     time_of_day, rolling_correlations
+    
+    window = "current" (default, last 180d) or "prior" (prior 180d, OOS)
     """
     if preset_name not in data_export_module.PRESET_REGISTRY:
         return JSONResponse(
             {"error": f"unknown preset '{preset_name}'. Valid: {list(data_export_module.PRESET_REGISTRY.keys())}"}, 404)
 
-    if not BARS_INTRADAY_CACHE.exists():
-        return JSONResponse({"error": "no cached bars on disk"}, 500)
+    if window == "prior":
+        cache = BARS_INTRADAY_PRIOR_CACHE
+        if not cache.exists():
+            return JSONResponse({"error": "prior-180d cache not built yet. POST /api/data_export/fetch_prior first."}, 409)
+    else:
+        cache = BARS_INTRADAY_CACHE
+        if not cache.exists():
+            return JSONResponse({"error": "no cached bars on disk"}, 500)
 
     try:
-        intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
-        log.info(f"data_export {preset_name}: building from {len(intraday)} coins")
+        intraday = pickle.loads(cache.read_bytes())
+        log.info(f"data_export {preset_name} ({window}): building from {len(intraday)} coins")
         build_fn = data_export_module.PRESET_REGISTRY[preset_name]
         files = build_fn(intraday, PRODUCTS, CATEGORIES, BENCHMARK)
         zip_bytes = data_export_module.build_preset_zip(preset_name, files)
-        fname = f"coinbase_export_{preset_name}_{today_utc()}.zip"
+        suffix = "_prior180d" if window == "prior" else ""
+        fname = f"coinbase_export_{preset_name}{suffix}_{today_utc()}.zip"
         return _Response(
             content=zip_bytes,
             media_type="application/zip",
@@ -2704,6 +2713,83 @@ def download_data_export(preset_name: str):
             "error": str(e),
             "traceback": traceback.format_exc(),
         }, 500)
+
+# ═══════════════════════════════════════════════════════════════════
+# PRIOR-180d HISTORICAL BAR FETCH — for out-of-sample backtesting
+# ═══════════════════════════════════════════════════════════════════
+#
+# Fetches bars from 360d ago to 180d ago and stores in a separate cache file.
+# One-time cost (~30-60 min on startup), rate-limited by Coinbase.
+# Used by the data_export endpoints with window="prior".
+
+BARS_INTRADAY_PRIOR_CACHE = CACHE_DIR / "bars_intraday_prior180d.pkl"
+
+prior_fetch_in_progress = False
+prior_fetch_progress = {"pct": 0, "msg": "idle"}
+
+def _run_prior_fetch_bg():
+    global prior_fetch_in_progress, prior_fetch_progress
+    if prior_fetch_in_progress: return
+    prior_fetch_in_progress = True
+    prior_fetch_progress = {"pct": 0, "msg": "starting"}
+    try:
+        def cb(p, m):
+            global prior_fetch_progress
+            prior_fetch_progress = {"pct": p, "msg": m}
+
+        cb(1, "preparing fetch window")
+        end_dt = now_utc().replace(minute=0, second=0, microsecond=0) - timedelta(days=180)
+        start_dt = end_dt - timedelta(days=180)
+        cb(2, f"fetching bars {start_dt.date()} to {end_dt.date()}")
+        log.info(f"prior_fetch: window {start_dt.isoformat()} → {end_dt.isoformat()}")
+
+        fetch_products = list(set(PRODUCTS + [BENCHMARK]))
+        client = cb_client()
+        out = {}
+        total = len(fetch_products)
+        for i, p in enumerate(fetch_products):
+            try:
+                bars = fetch_candles_for_product(client, p, start_dt, end_dt, CANDLE_GRANULARITY)
+                if bars:
+                    out[p] = bars
+            except Exception as e:
+                log.warning(f"prior_fetch: {p} failed: {e}")
+            pct = 2 + int((i+1) / total * 95)
+            cb(pct, f"{i+1}/{total} products — {p} ({len(bars) if bars else 0} bars)")
+        client.close()
+
+        cb(98, f"caching {sum(len(v) for v in out.values())} bars to disk")
+        BARS_INTRADAY_PRIOR_CACHE.write_bytes(pickle.dumps(out))
+        cb(100, f"done. {len(out)} products, {sum(len(v) for v in out.values())} bars")
+        log.info(f"prior_fetch: cached {len(out)} products / {sum(len(v) for v in out.values())} bars")
+    except Exception as e:
+        log.exception(f"prior_fetch failed: {e}")
+        prior_fetch_progress = {"pct": 100, "msg": f"error: {e}"}
+    finally:
+        prior_fetch_in_progress = False
+
+@app.post("/api/data_export/fetch_prior")
+def start_prior_fetch(bg: BackgroundTasks):
+    """Kick off prior-180d bar fetch if not already running or cached fresh."""
+    if prior_fetch_in_progress:
+        return {"status": "already_in_progress", "progress": prior_fetch_progress}
+    if BARS_INTRADAY_PRIOR_CACHE.exists():
+        age = cache_age_hours(BARS_INTRADAY_PRIOR_CACHE)
+        if age < 24 * 30:  # cache good for 30 days (data is historical, won't change)
+            return {"status": "cache_fresh", "age_hours": round(age, 1),
+                    "cache_path": str(BARS_INTRADAY_PRIOR_CACHE)}
+    bg.add_task(_run_prior_fetch_bg)
+    return {"status": "started"}
+
+@app.get("/api/data_export/fetch_prior/status")
+def get_prior_fetch_status():
+    return {
+        "inProgress": prior_fetch_in_progress,
+        "progress": prior_fetch_progress,
+        "cache_exists": BARS_INTRADAY_PRIOR_CACHE.exists(),
+        "cache_age_hours": round(cache_age_hours(BARS_INTRADAY_PRIOR_CACHE), 1)
+          if BARS_INTRADAY_PRIOR_CACHE.exists() else None,
+    }
 
 # SPA fallback
 dist_path = Path(__file__).parent / "dist"

@@ -2663,8 +2663,9 @@ function PaperSimPanel({ pinned }) {
 
 function DataExportTab() {
   const [presets, setPresets] = useState([]);
-  const [downloading, setDownloading] = useState(null);   // preset name currently downloading
+  const [downloading, setDownloading] = useState(null);   // e.g. "hourly_features:current"
   const [error, setError] = useState(null);
+  const [priorStatus, setPriorStatus] = useState(null);
 
   useEffect(() => {
     fetch('/api/data_export/presets').then(r => r.json())
@@ -2672,24 +2673,51 @@ function DataExportTab() {
       .catch(e => setError(e.message));
   }, []);
 
-  const downloadPreset = async (name) => {
-    setDownloading(name); setError(null);
+  // Poll prior-fetch status
+  useEffect(() => {
+    const poll = () => {
+      fetch('/api/data_export/fetch_prior/status').then(r => r.json())
+        .then(setPriorStatus).catch(() => {});
+    };
+    poll();
+    const iv = setInterval(poll, priorStatus?.inProgress ? 3000 : 20000);
+    return () => clearInterval(iv);
+  }, [priorStatus?.inProgress]);
+
+  const startPriorFetch = async () => {
+    setError(null);
     try {
-      const r = await fetch(`/api/data_export/${name}`);
+      const r = await fetch('/api/data_export/fetch_prior', { method: 'POST' });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      if (d.status === 'cache_fresh') {
+        setError(`Prior-180d cache already exists (${d.age_hours}h old). Ready to use.`);
+      }
+    } catch (e) { setError(e.message); }
+  };
+
+  const downloadPreset = async (name, window = "current") => {
+    const key = `${name}:${window}`;
+    setDownloading(key); setError(null);
+    try {
+      const url = window === "prior"
+        ? `/api/data_export/${name}?window=prior`
+        : `/api/data_export/${name}`;
+      const r = await fetch(url);
       if (!r.ok) {
         const d = await r.json();
         throw new Error(d.error || `HTTP ${r.status}`);
       }
       const blob = await r.blob();
       const fname = r.headers.get('content-disposition')?.match(/filename="(.+)"/)?.[1]
-        || `coinbase_export_${name}.zip`;
-      const url = URL.createObjectURL(blob);
+        || `coinbase_export_${name}_${window}.zip`;
+      const u = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = fname;
+      a.href = u; a.download = fname;
       document.body.appendChild(a); a.click();
-      document.body.removeChild(a); URL.revokeObjectURL(url);
+      document.body.removeChild(a); URL.revokeObjectURL(u);
     } catch (e) {
-      setError(`${name}: ${e.message}`);
+      setError(`${name} (${window}): ${e.message}`);
     } finally {
       setDownloading(null);
     }
@@ -2731,6 +2759,45 @@ function DataExportTab() {
           Each preset downloads as a ZIP with 1-3 CSVs + a self-describing README.
           Upload one to a fresh Claude conversation with the suggested prompt to investigate
           that specific question. Iterate by downloading different presets as findings suggest.
+        </div>
+      </Box>
+
+      {/* Prior-180d OOS fetch controls */}
+      <Box>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+          <div>
+            <div style={{fontSize:11,color:"#a855f7",letterSpacing:0.5,textTransform:"uppercase",fontWeight:700,marginBottom:4}}>
+              Prior 180d (Out-of-Sample) Historical Data
+            </div>
+            <div style={{fontSize:11,color:"#94a3b8",lineHeight:1.5}}>
+              Fetch the 180-day window BEFORE the current operational cache (i.e. 360d ago → 180d ago).
+              Use this to test whether patterns found in current data hold on truly out-of-sample history.
+              One-time ~30-60 min fetch; then the purple "Prior 180d (OOS)" buttons on each preset become active.
+            </div>
+            {priorStatus?.cache_exists && (
+              <div style={{fontSize:10,color:"#d8b4fe",marginTop:6}}>
+                ✓ Prior-180d cache available
+                {priorStatus.cache_age_hours != null && ` (built ${priorStatus.cache_age_hours}h ago)`}
+              </div>
+            )}
+            {priorStatus?.inProgress && (
+              <div style={{marginTop:8}}>
+                <div style={{background:"rgba(168,85,247,0.15)",borderRadius:3,height:6,overflow:"hidden"}}>
+                  <div style={{width:`${priorStatus.progress?.pct ?? 0}%`,height:6,background:"#a855f7",transition:"width 0.3s"}}/>
+                </div>
+                <div style={{fontSize:10,color:"#a855f7",marginTop:4}}>
+                  {priorStatus.progress?.msg ?? ""} ({priorStatus.progress?.pct ?? 0}%)
+                </div>
+              </div>
+            )}
+          </div>
+          <Btn onClick={startPriorFetch}
+            disabled={priorStatus?.inProgress}
+            color="#a855f7" style={{padding:"6px 14px",fontSize:11,fontWeight:700,whiteSpace:"nowrap"}}>
+            {priorStatus?.inProgress
+              ? `Fetching ${priorStatus.progress?.pct ?? 0}%...`
+              : (priorStatus?.cache_exists ? "🔄 Refetch Prior 180d" : "📥 Fetch Prior 180d")}
+          </Btn>
         </div>
       </Box>
 
@@ -2780,11 +2847,16 @@ function DataExportTab() {
                   </div>
                 )}
               </div>
-              <div>
-                <Btn onClick={() => downloadPreset(preset.name)}
+              <div style={{display:"flex",flexDirection:"column",gap:4,alignItems:"flex-end"}}>
+                <Btn onClick={() => downloadPreset(preset.name, "current")}
                   disabled={downloading !== null}
                   color="#06b6d4" style={{padding:"6px 14px",fontSize:11,fontWeight:700,whiteSpace:"nowrap"}}>
-                  {downloading === preset.name ? "Building..." : "⬇ Download ZIP"}
+                  {downloading === `${preset.name}:current` ? "Building..." : "⬇ Current 180d"}
+                </Btn>
+                <Btn onClick={() => downloadPreset(preset.name, "prior")}
+                  disabled={downloading !== null || !priorStatus?.cache_exists}
+                  color="#a855f7" style={{padding:"4px 10px",fontSize:10,fontWeight:600,whiteSpace:"nowrap",opacity: priorStatus?.cache_exists ? 1 : 0.4}}>
+                  {downloading === `${preset.name}:prior` ? "Building..." : "⬇ Prior 180d (OOS)"}
                 </Btn>
               </div>
             </div>
