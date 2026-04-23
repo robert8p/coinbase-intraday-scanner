@@ -2001,7 +2001,8 @@ def _v2_compute_live_features(intraday_by_product, daily_by_product,
         return {}, {}
 
     btc_atr = v2_module.compute_atr_fraction(btc_bars)
-    btc_ctx = v2_module.compute_btc_context_v2(btc_bars[-48:], btc_atr)
+    # Pass enough bars for 3-day return computation (288 bars = 3 days).
+    btc_ctx = v2_module.compute_btc_context_v2(btc_bars[-320:], btc_atr)
 
     scan_hour = scan_time.hour
 

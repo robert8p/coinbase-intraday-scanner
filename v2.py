@@ -323,14 +323,26 @@ def compute_btc_context_v2(btc_bars_before, atr_btc_frac):
     """BTC market-factor context. All values are scalars, same for every coin
     at a given scan. atr_btc_frac is BTC's own ATR for normalization."""
     if len(btc_bars_before) < 13:
-        return {"btc_ret_4b":0.0,"btc_ret_12b":0.0,"btc_vol":0.0}
+        return {"btc_ret_4b":0.0,"btc_ret_12b":0.0,"btc_vol":0.0,
+                "btc_3d_ret_pct":0.0}
     closes = [b["c"] for b in btc_bars_before]
     btc_ret_4b = math.log(closes[-1]/closes[-5]) if closes[-5] > 0 else 0.0
     btc_ret_12b = math.log(closes[-1]/closes[-13]) if closes[-13] > 0 else 0.0
     # realized vol
     rets = [math.log(closes[i]/closes[i-1]) for i in range(1,len(closes)) if closes[i-1]>0]
     vol = _std(rets) * math.sqrt(BARS_PER_DAY) if len(rets) > 1 else 0
-    return {"btc_ret_4b":btc_ret_4b, "btc_ret_12b":btc_ret_12b, "btc_vol":vol}
+    # 3-day raw percent return (288 × 15-min bars = 3 days)
+    # Used by threshold rules; not in FEATURE_NAMES_V2 so v2 model unaffected.
+    if len(closes) >= 289 and closes[-289] > 0:
+        btc_3d_ret_pct = (closes[-1] / closes[-289] - 1) * 100
+    else:
+        # Best-effort fallback if we have fewer bars: use whatever we have
+        if closes[0] > 0 and len(closes) > 1:
+            btc_3d_ret_pct = (closes[-1] / closes[0] - 1) * 100
+        else:
+            btc_3d_ret_pct = 0.0
+    return {"btc_ret_4b":btc_ret_4b, "btc_ret_12b":btc_ret_12b, "btc_vol":vol,
+            "btc_3d_ret_pct":btc_3d_ret_pct}
 
 def compute_beta_to_btc(coin_bars, btc_bars, n=50):
     """Rolling beta of coin returns to BTC returns over last n bars.
@@ -576,10 +588,11 @@ def compute_features_v2(bars, daily_bars, current_price, open_price, scan_hour,
                 squeeze_fire = 1 if (was_squeezed and broke_out) else 0
 
     # ── E. BTC & category context ──
-    bc = btc_context or {"btc_ret_4b":0.0,"btc_ret_12b":0.0,"btc_vol":0.0}
+    bc = btc_context or {"btc_ret_4b":0.0,"btc_ret_12b":0.0,"btc_vol":0.0,"btc_3d_ret_pct":0.0}
     btc_ret_4b = bc["btc_ret_4b"]
     btc_ret_12b = bc["btc_ret_12b"]
     btc_vol = bc["btc_vol"]
+    btc_3d_ret_pct = bc.get("btc_3d_ret_pct", 0.0)  # threshold feature for regime filters
     # ret_vs_btc_atr: coin's recent return minus BTC's, normalized by this
     # coin's ATR
     coin_ret_4b = math.log(closes[-1]/closes[-5]) if len(closes) > 5 and closes[-5] > 0 else 0
@@ -647,6 +660,8 @@ def compute_features_v2(bars, daily_bars, current_price, open_price, scan_hour,
         # so v2 classifier won't see them; only pinned rules that explicitly reference
         # them will use them).
         "ret_6h_pct":ret_6h_pct,"ret_12h_pct":ret_12h_pct,"ret_24h_pct":ret_24h_pct,
+        # BTC regime filter features (raw %)
+        "btc_3d_ret_pct":btc_3d_ret_pct,
     }
 
 def add_cross_sectional_features_v2(features_list, cat_list, dollar_vol_list):

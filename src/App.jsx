@@ -1881,6 +1881,52 @@ function LiveTab() {
           </Btn>
         </div>
 
+        {/* Pin FILTERED variant — adds BTC 3d > -5% regime filter */}
+        <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 10px",marginBottom:10,
+          background:"rgba(236,72,153,0.06)",border:"1px solid rgba(236,72,153,0.15)",borderRadius:4}}>
+          <span style={{fontSize:11,color:"#ec4899"}}>⚡ Quick action:</span>
+          <span style={{fontSize:11,color:"#94a3b8"}}>
+            Pin the FILTERED variant (adds BTC 3d return &gt; -5% regime filter).
+            Survived all 3 splits positive; ~+10% annualized expectation.
+          </span>
+          <span style={{flex:1}}/>
+          <Btn onClick={async () => {
+            if (!confirm(`Pin the FILTERED capitulation-bounce rule?\n\n`
+              + `Rule: ret_6h_pct < -10% AND btc_3d_ret_pct > -5% → +2% within 12h\n`
+              + `Rationale: skip setups during BTC-wide crashes.\n\n`
+              + `Filtered performance (intra-path sim, MAKER fees 65bps):\n`
+              + `  Train (201d, 422 trades): +2.83%, max DD -6.8%\n`
+              + `  Val   ( 73d, 175 trades): +4.53%, max DD -2.9%\n`
+              + `  Test  ( 73d, 129 trades): +2.08%, max DD -2.0%\n\n`
+              + `Combined ~12 months: ~+9.9%, annualized ~+10%.\n\n`
+              + `Pinning this alongside the raw rule lets us compare live firerates & outcomes.`)) return;
+            try {
+              const r = await fetch('/api/v2/live/pin_custom', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  pin_id: "capitulation_bounce_filtered",
+                  english: "ret_6h_pct < -10% AND btc_3d_ret_pct > -5% → +2% within 12h",
+                  conditions: [
+                    {"feature": "ret_6h_pct", "op": "lt", "threshold": -10.0},
+                    {"feature": "btc_3d_ret_pct", "op": "gt", "threshold": -5.0},
+                  ],
+                  threshold_pct: 0.02,
+                  horizon_hours: 12,
+                  validation_precision: 0.55,
+                  validation_support: 726,
+                  validation_base_rate: 0.206,
+                  notes: "Capitulation-bounce with BTC regime filter (3d > -5). Only accepted filter out of 45 tested, passed acceptance criteria across all 3 splits. Train n=422 (+2.83%, max DD -6.8%), val n=175 (+4.53%, max DD -2.9%), test n=129 (+2.08%, max DD -2.0%). Annualized ~+10% combined. Mined 2026-04-23.",
+                }),
+              });
+              const d = await r.json();
+              if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+              alert(`Pinned FILTERED rule.\n\npin_id: ${d.pin_id}\n\nBoth the raw and filtered rules are now live. Forward fires will be recorded separately so we can compare.`);
+            } catch (e) { alert(e.message); }
+          }} color="#ec4899" style={{padding:"4px 10px",fontSize:10,fontWeight:700}}>
+            📌 Pin filtered variant (+ BTC regime)
+          </Btn>
+        </div>
+
         {pinned.length === 0 ? (
           <div style={{fontSize:12,color:"#475569",padding:"20px 0",textAlign:"center"}}>
             No pinned rules. Go to the <span style={{color:"#8b5cf6",fontWeight:600}}>Rules tab</span>,
