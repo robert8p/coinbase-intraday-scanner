@@ -797,7 +797,7 @@ def run_train_cell_v2(k_atr, horizon_hours, intraday_bars, daily_bars,
                 continue
 
             btc_atr = compute_atr_fraction(btc_history)
-            btc_ctx = compute_btc_context_v2(btc_history[-48:], btc_atr)
+            btc_ctx = compute_btc_context_v2(btc_history[-320:], btc_atr)  # 320 bars for 3d return
 
             # ── Per-coin loop ──
             date_feats, date_meta, date_cats, date_dv = [], [], [], []
@@ -1108,7 +1108,7 @@ def build_rows_for_rule_mining(intraday_bars, daily_bars, products, categories,
             btc_history = btc_earlier + btc_before_today
             if len(btc_history) < 50: continue
             btc_atr = compute_atr_fraction(btc_history)
-            btc_ctx = compute_btc_context_v2(btc_history[-48:], btc_atr)
+            btc_ctx = compute_btc_context_v2(btc_history[-320:], btc_atr)  # 320 bars for 3d return
 
             date_feats, date_meta, date_cats, date_dv = [], [], [], []
 
